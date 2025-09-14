@@ -1,4 +1,5 @@
 import os
+import csv
 import json
 import shutil
 import subprocess
@@ -130,7 +131,7 @@ def is_video_path(path: str) -> bool:
     return ext in {".mp4", ".avi", ".mov", ".mkv"}
 
 
-def process_video(local_video_path: Path) -> Path:
+def process_video(local_video_path: Path) -> tuple[Path, Path | None]:
     video_name = local_video_path.stem
     processor = StopVideo(
         video_name=video_name,
@@ -146,7 +147,27 @@ def process_video(local_video_path: Path) -> Path:
     # Path to the advanced output
     output_dir = Path("output") / video_name
     advanced = output_dir / "inference_advanced.mp4"
-    return advanced
+    # Generate violations CSV report
+    csv_path: Path | None = None
+    try:
+        fps = float(processor.video_info.fps) if processor.video_info and processor.video_info.fps else None
+        csv_path = output_dir / f"{video_name}_stop_detection_report.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["car_id", "status", "first_frame", "last_frame", "first_time_s", "last_time_s"])
+            for car_id, data in (processor.analysis or {}).items():
+                status = data.get("Status")
+                if status and "Failed" in status:
+                    first_f = processor.first_last_frames.get(car_id, {}).get("first")
+                    last_f = processor.first_last_frames.get(car_id, {}).get("last")
+                    first_t = (first_f / fps) if (fps and first_f is not None) else None
+                    last_t = (last_f / fps) if (fps and last_f is not None) else None
+                    writer.writerow([car_id, status, first_f, last_f, first_t, last_t])
+    except Exception as e:
+        logging.error(f"Failed to generate violations CSV: {e}")
+        csv_path = None
+    return advanced, csv_path
 
 
 def is_valid_video(video_path: Path) -> bool:
@@ -192,12 +213,12 @@ def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_pat
 
             video_blob.upload_from_filename(output_video_path)
 
-        # Upload CSV report (optional)
+        # Upload CSV report (optional) under stop-detection-reports/
         if csv_file_path and os.path.exists(csv_file_path):
-            csv_blob = bucket.blob(f"range-detection-reports/{video_name}_range_detection_report.csv")
+            csv_blob = bucket.blob(f"stop-detection-reports/{video_name}_stop_detection_report.csv")
             csv_blob.upload_from_filename(csv_file_path)
             logging.info(
-                f"Uploaded CSV report to gs://{bucket_name}/range-detection-reports/{video_name}_range_detection_report.csv"
+                f"Uploaded CSV report to gs://{bucket_name}/stop-detection-reports/{video_name}_stop_detection_report.csv"
             )
 
         return True
@@ -269,7 +290,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                 f"Vehicle model not found at '{VEHICLE_MODEL_PATH}'. Set VEHICLE_MODEL_PATH env or place the file."
             )
 
-        advanced_out = process_video(local_path)
+        advanced_out, csv_path = process_video(local_path)
         print(f"Processing completed for: {local_path}")
 
         # Validate output video before upload
@@ -282,7 +303,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
         _ = upload_results_to_gcs(
             bucket_name=DEST_BUCKET,
             output_video_path=str(advanced_out),
-            csv_file_path=None,
+            csv_file_path=str(csv_path) if csv_path else None,
             video_name=input_stem,
         )
         message.ack()
