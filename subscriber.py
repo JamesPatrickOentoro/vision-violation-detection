@@ -69,14 +69,48 @@ def convert_avi_to_mp4(input_path: str, output_path: str) -> bool:
             logging.info(f"Running FFmpeg command: {' '.join(cmd)}")
 
             # Run FFmpeg with timeout and capture output
-            subprocess.run(
-                cmd,
-                check=True,
-                timeout=300,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            logging.info("FFmpeg conversion successful")
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    timeout=900,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                logging.info("FFmpeg conversion completed (exit 0)")
+            except subprocess.CalledProcessError as e:
+                # Some damaged inputs can yield non-zero exit even if output is usable.
+                # Accept the output if it validates as a playable video.
+                err = e.stderr.decode('utf-8', errors='ignore') if e.stderr else ''
+                logging.warning("FFmpeg returned non-zero exit code; will validate output: %s", e.returncode)
+                if err:
+                    logging.debug("ffmpeg stderr (truncated): %s", err[-4000:])
+                if is_valid_video(Path(output_path)):
+                    logging.info("Output validated despite ffmpeg error; proceeding with converted file")
+                else:
+                    # Fallback attempt: drop audio and relax sync
+                    fallback_cmd = [
+                        "ffmpeg", "-y",
+                        "-err_detect", "ignore_err",
+                        "-fflags", "+genpts",
+                        "-avoid_negative_ts", "make_zero",
+                        "-i", input_path,
+                        "-vf", "scale=1280:720",
+                        "-b:v", "572k",
+                        "-c:v", "libx264",
+                        "-an",  # drop audio in fallback to avoid audio decode errors
+                        "-vsync", "2",
+                        output_path,
+                    ]
+                    logging.info("Retrying conversion without audio: %s", ' '.join(fallback_cmd))
+                    subprocess.run(
+                        fallback_cmd,
+                        check=True,
+                        timeout=900,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    logging.info("Fallback conversion completed")
 
             # Verify the converted file has content
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
