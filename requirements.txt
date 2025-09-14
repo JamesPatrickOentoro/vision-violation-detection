@@ -1,0 +1,19 @@
+# Core ML and vision
+ultralytics>=8.3.50
+supervision>=0.19.0
+opencv-python>=4.7.0
+numpy>=1.24.0
+tqdm>=4.66.0
+
+# Google Cloud clients (Pub/Sub + Storage)
+google-cloud-pubsub>=2.19.0
+google-cloud-storage>=2.16.0
+
+# Optional (used by some scripts / notebooks)
+matplotlib>=3.7.0
+
+# Notes:
+# - ffmpeg is required at the OS level for AVI->MP4 conversion (install via apt/brew/choco).
+# - If you plan to use the older Roboflow-based scripts, also install:
+#   roboflow
+#   inference
