@@ -257,16 +257,28 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
 
         print(f"New finalized object detected: gs://{bucket}/{object_name}")
 
-        # Compute destination object name upfront and skip if already processed
+        # Compute destination object name upfront and skip if already processed (and non-empty)
         input_stem = Path(object_name).stem
         dest_filename = f"{input_stem}_processed.mp4"
         dest_obj = f"{DEST_PREFIX.rstrip('/')}/{dest_filename}"
         storage_client = storage.Client()
         dest_blob = storage_client.bucket(DEST_BUCKET).blob(dest_obj)
         if dest_blob.exists():
-            print(f"Already processed. Skipping: gs://{DEST_BUCKET}/{dest_obj}")
-            message.ack()
-            return
+            try:
+                dest_blob.reload()
+                size = int(dest_blob.size or 0)
+            except Exception:
+                size = 0
+            if size > 1024:  # treat >1KB as a valid processed artifact
+                print(
+                    f"Already processed (size={size} bytes). Skipping: gs://{DEST_BUCKET}/{dest_obj}"
+                )
+                message.ack()
+                return
+            else:
+                print(
+                    f"Existing processed object is too small (size={size}); will reprocess and overwrite."
+                )
 
         local_path = DOWNLOAD_DIR / Path(object_name).name
         download_gcs_object(bucket, object_name, local_path)
