@@ -149,6 +149,63 @@ def process_video(local_video_path: Path) -> Path:
     return advanced
 
 
+def is_valid_video(video_path: Path) -> bool:
+    try:
+        if not video_path.exists() or os.path.getsize(video_path) == 0:
+            return False
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return False
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return frames > 0
+    except Exception:
+        return False
+
+
+def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_path: str | None, video_name: str) -> bool:
+    """Upload processed results to Google Cloud Storage with better folder structure"""
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+
+        # Upload processed video
+        if output_video_path and os.path.exists(output_video_path):
+            # Determine file extension based on actual file type
+            if output_video_path.endswith('.avi'):
+                video_blob = bucket.blob(f"processed-videos/{video_name}_processed.avi")
+                logging.info(
+                    f"Uploading processed video (AVI) to gs://{bucket_name}/processed-videos/{video_name}_processed.avi"
+                )
+            elif output_video_path.endswith('.mp4'):
+                video_blob = bucket.blob(f"processed-videos/{video_name}_processed.mp4")
+                logging.info(
+                    f"Uploading processed video (MP4) to gs://{bucket_name}/processed-videos/{video_name}_processed.mp4"
+                )
+            else:
+                # Fallback for other formats
+                file_ext = os.path.splitext(output_video_path)[1]
+                video_blob = bucket.blob(f"processed-videos/{video_name}_processed{file_ext}")
+                logging.info(
+                    f"Uploading processed video ({file_ext}) to gs://{bucket_name}/processed-videos/{video_name}_processed{file_ext}"
+                )
+
+            video_blob.upload_from_filename(output_video_path)
+
+        # Upload CSV report (optional)
+        if csv_file_path and os.path.exists(csv_file_path):
+            csv_blob = bucket.blob(f"range-detection-reports/{video_name}_range_detection_report.csv")
+            csv_blob.upload_from_filename(csv_file_path)
+            logging.info(
+                f"Uploaded CSV report to gs://{bucket_name}/range-detection-reports/{video_name}_range_detection_report.csv"
+            )
+
+        return True
+    except Exception as e:
+        logging.error(f"Error uploading results: {e}")
+        return False
+
+
 def upload_file_to_gcs(src_path: Path, bucket_name: str, dest_object: str) -> None:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
@@ -215,15 +272,19 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
         advanced_out = process_video(local_path)
         print(f"Processing completed for: {local_path}")
 
-        # Upload only the advanced output with name <input_stem>_processed.mp4 under processed-videos/
-        # Use precondition to avoid overwriting if another worker already uploaded
-        try:
-            dest_blob.if_generation_match = 0  # create only if not exists
-            dest_blob.content_type = "video/mp4"
-            dest_blob.upload_from_filename(str(advanced_out))
-            print(f"Uploaded {advanced_out} -> gs://{DEST_BUCKET}/{dest_obj}")
-        except gax_exceptions.PreconditionFailed:
-            print(f"Processed file already exists (race). Skipping upload: gs://{DEST_BUCKET}/{dest_obj}")
+        # Validate output video before upload
+        if not is_valid_video(advanced_out):
+            raise RuntimeError(
+                f"Advanced output invalid or empty: {advanced_out}. Not uploading."
+            )
+
+        # Upload using helper (names as <input_stem>_processed.<ext>)
+        _ = upload_results_to_gcs(
+            bucket_name=DEST_BUCKET,
+            output_video_path=str(advanced_out),
+            csv_file_path=None,
+            video_name=input_stem,
+        )
         message.ack()
     except Exception as e:
         # Let Pub/Sub redeliver by not acking
