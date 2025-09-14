@@ -129,7 +129,7 @@ def is_video_path(path: str) -> bool:
     return ext in {".mp4", ".avi", ".mov", ".mkv"}
 
 
-def process_video(local_video_path: Path) -> list[Path]:
+def process_video(local_video_path: Path) -> Path:
     video_name = local_video_path.stem
     processor = StopVideo(
         video_name=video_name,
@@ -140,16 +140,12 @@ def process_video(local_video_path: Path) -> list[Path]:
 
     processor.inference()
     processor.analyze()
-    # Render annotated outputs
-    processor.render_video_simple()
+    # Render only the advanced annotated output
     processor.render_video_advanced()
-    # Return generated files if present
+    # Path to the advanced output
     output_dir = Path("output") / video_name
-    outputs = [
-        output_dir / "inference_simple.mp4",
-        output_dir / "inference_advanced.mp4",
-    ]
-    return [p for p in outputs if p.exists()]
+    advanced = output_dir / "inference_advanced.mp4"
+    return advanced
 
 
 def upload_file_to_gcs(src_path: Path, bucket_name: str, dest_object: str) -> None:
@@ -204,15 +200,14 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                 f"Vehicle model not found at '{VEHICLE_MODEL_PATH}'. Set VEHICLE_MODEL_PATH env or place the file."
             )
 
-        outputs = process_video(local_path)
+        advanced_out = process_video(local_path)
         print(f"Processing completed for: {local_path}")
 
-        # Upload processed outputs to GCS
-        for out_path in outputs:
-            # Place under processed-videos/<basename>/...
-            base = local_path.stem  # original file base name
-            dest_obj = f"{DEST_PREFIX.rstrip('/')}/{base}/{out_path.name}"
-            upload_file_to_gcs(out_path, DEST_BUCKET, dest_obj)
+        # Upload only the advanced output with name <input_stem>_processed.mp4 under processed-videos/
+        input_stem = Path(object_name).stem
+        dest_filename = f"{input_stem}_processed.mp4"
+        dest_obj = f"{DEST_PREFIX.rstrip('/')}/{dest_filename}"
+        upload_file_to_gcs(advanced_out, DEST_BUCKET, dest_obj)
         message.ack()
     except Exception as e:
         # Let Pub/Sub redeliver by not acking
