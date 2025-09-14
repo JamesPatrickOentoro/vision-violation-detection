@@ -60,7 +60,7 @@ def convert_avi_to_mp4(input_path: str, output_path: str) -> bool:
                 "-vf", "scale=1280:720",        # Resize to 1280x720
                 "-b:v", "572k",                 # Set video bitrate to 572kbps
                 "-c:v", "libx264",             # Use H.264 codec
-                "-c:a", "aac",                 # Convert audio to AAC
+                "-an",                          # Drop audio to avoid decode errors
                 "-movflags", "+faststart",     # Optional: faster playback start
                 "-max_muxing_queue_size", "1024",  # Handle large queues
                 output_path
@@ -181,6 +181,8 @@ def process_video(local_video_path: Path) -> tuple[Path, Path | None]:
     # Path to the advanced output
     output_dir = Path("output") / video_name
     advanced = output_dir / "inference_advanced.mp4"
+    # Remux to faststart for better compatibility
+    advanced = faststart_mp4(advanced)
     # Generate violations CSV report
     csv_path: Path | None = None
     try:
@@ -216,6 +218,27 @@ def is_valid_video(video_path: Path) -> bool:
         return frames > 0
     except Exception:
         return False
+
+
+def faststart_mp4(input_path: Path) -> Path:
+    """Remux MP4 to move moov atom to start for better streaming compatibility."""
+    try:
+        if shutil.which('ffmpeg') is None:
+            return input_path  # Can't fix without ffmpeg
+        fixed = input_path.with_name(input_path.stem + "_fixed.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(fixed),
+        ]
+        subprocess.run(cmd, check=True, timeout=300, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if is_valid_video(fixed):
+            return fixed
+        return input_path
+    except Exception:
+        return input_path
 
 
 def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_path: str | None, video_name: str) -> bool:

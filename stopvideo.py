@@ -242,6 +242,13 @@ class StopVideo:
         print(f"Loading video from local path: '{self.local_video_path}'")
         try:
             video_info = sv.VideoInfo.from_video_path(video_path=self.local_video_path)
+            # Fallback if fps is invalid (can happen with some AVI sources)
+            try:
+                if not getattr(video_info, 'fps', None) or video_info.fps <= 0:
+                    print("Invalid FPS detected in source; defaulting to 30 fps for output")
+                    video_info.fps = 30
+            except Exception:
+                pass
             # The frames_generator is created in the inference method now
             # using sv.get_video_frames_generator for better compatibility.
             return video_info, None 
