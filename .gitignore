@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs and artifacts
+output/
+first_frames/
+
+# Large media
+*.mp4
+*.avi
+
+# Model weights
+*.pt
+
+# Secrets
+adaro-vision-poc-e36a1eaf86f5.json
