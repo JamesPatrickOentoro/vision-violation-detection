@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -241,45 +242,90 @@ def faststart_mp4(input_path: Path) -> Path:
         return input_path
 
 
-def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_path: str | None, video_name: str) -> bool:
-    """Upload processed results to Google Cloud Storage with better folder structure"""
+def create_storage_client() -> storage.Client:
+    return storage.Client()
+
+
+def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_path: str | None, video_name: str, max_retries: int = 3) -> bool:
+    """Upload processed results to Google Cloud Storage with retries and verification"""
+
+    def verify_upload(blob: storage.Blob, local_file: str) -> bool:
+        if not blob.exists():
+            return False
+        try:
+            blob.reload()
+        except Exception:
+            pass
+        local_size = os.path.getsize(local_file)
+        remote_size = int(getattr(blob, 'size', 0) or 0)
+        return remote_size == local_size and remote_size > 0
+
+    def upload_with_retry(blob: storage.Blob, filepath: str, file_type: str = "file") -> bool:
+        # Set a chunk size to force resumable uploads for larger files
+        blob.chunk_size = 8 * 1024 * 1024  # 8 MB
+
+        for attempt in range(max_retries):
+            try:
+                # Content type mapping
+                content_type = (
+                    'video/mp4' if filepath.endswith('.mp4') else
+                    'video/x-msvideo' if filepath.endswith('.avi') else
+                    'text/csv' if filepath.endswith('.csv') else
+                    'application/octet-stream'
+                )
+                blob.content_type = content_type
+                blob.metadata = {
+                    'uploaded_by': 'stop_detection_system',
+                    'upload_timestamp': datetime.now().isoformat(),
+                    'original_filename': os.path.basename(filepath),
+                }
+
+                blob.upload_from_filename(filepath)
+
+                if verify_upload(blob, filepath):
+                    logging.info(
+                        f"Successfully uploaded and verified {file_type} to gs://{bucket_name}/{blob.name}"
+                    )
+                    return True
+                else:
+                    logging.warning(
+                        f"Upload verification failed for {file_type}, attempt {attempt + 1}/{max_retries}"
+                    )
+            except Exception as e:
+                logging.warning(
+                    f"Upload attempt {attempt + 1} failed for {file_type}: {e}"
+                )
+                if attempt == max_retries - 1:
+                    raise
+        return False
+
     try:
-        storage_client = storage.Client()
+        storage_client = create_storage_client()
         bucket = storage_client.bucket(bucket_name)
 
         # Upload processed video
         if output_video_path and os.path.exists(output_video_path):
-            # Determine file extension based on actual file type
-            if output_video_path.endswith('.avi'):
-                video_blob = bucket.blob(f"processed-videos/{video_name}_processed.avi")
-                logging.info(
-                    f"Uploading processed video (AVI) to gs://{bucket_name}/processed-videos/{video_name}_processed.avi"
-                )
-            elif output_video_path.endswith('.mp4'):
-                video_blob = bucket.blob(f"processed-videos/{video_name}_processed.mp4")
-                logging.info(
-                    f"Uploading processed video (MP4) to gs://{bucket_name}/processed-videos/{video_name}_processed.mp4"
-                )
-            else:
-                # Fallback for other formats
-                file_ext = os.path.splitext(output_video_path)[1]
-                video_blob = bucket.blob(f"processed-videos/{video_name}_processed{file_ext}")
-                logging.info(
-                    f"Uploading processed video ({file_ext}) to gs://{bucket_name}/processed-videos/{video_name}_processed{file_ext}"
-                )
-
-            video_blob.upload_from_filename(output_video_path)
+            file_ext = os.path.splitext(output_video_path)[1]
+            video_blob = bucket.blob(f"processed-videos/{video_name}_processed{file_ext}")
+            if not upload_with_retry(video_blob, output_video_path, "video"):
+                raise Exception("Video upload failed after retries")
 
         # Upload CSV report (optional) under stop-detection-reports/
         if csv_file_path and os.path.exists(csv_file_path):
             csv_blob = bucket.blob(f"stop-detection-reports/{video_name}_stop_detection_report.csv")
-            csv_blob.upload_from_filename(csv_file_path)
-            logging.info(
-                f"Uploaded CSV report to gs://{bucket_name}/stop-detection-reports/{video_name}_stop_detection_report.csv"
-            )
+            if not upload_with_retry(csv_blob, csv_file_path, "CSV report"):
+                raise Exception("CSV report upload failed after retries")
 
         return True
     except Exception as e:
+        msg = str(e)
+        if "Provided scope(s) are not authorized" in msg or "insufficientPermissions" in msg:
+            logging.error(
+                "GCS upload failed due to missing OAuth scopes. Ensure one of: "
+                "1) Set GOOGLE_APPLICATION_CREDENTIALS to a service account JSON with Storage permissions; "
+                "2) If running on GCE/GKE, grant the VM/pod service account Storage roles and add the 'Cloud Platform' scope; "
+                "3) Or run `gcloud auth application-default login` for local ADC."
+            )
         logging.error(f"Error uploading results: {e}")
         return False
 
