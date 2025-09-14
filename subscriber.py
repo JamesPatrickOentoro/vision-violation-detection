@@ -185,7 +185,8 @@ def process_video(local_video_path: Path) -> tuple[Path, Path | None]:
         except Exception:
             pass
     processor.render_video_advanced_cv2(str(tmp_out))
-    advanced = faststart_mp4(tmp_out)
+    # Always produce a stable H.264 MP4 with yuv420p and +faststart for web preview
+    advanced = reencode_mp4(tmp_out)
     # If invalid or empty, force re-encode
     if not is_valid_video(advanced):
         logging.warning("Advanced output appears invalid; forcing re-encode to stable MP4")
