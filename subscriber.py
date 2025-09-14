@@ -16,8 +16,14 @@ from stopvideo import StopVideo
 # Configuration via environment variables with sensible defaults
 PROJECT_ID = os.environ.get("PROJECT_ID", "adaro-vision-poc")
 SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID", "adaro-stop-detection-sub")
-# Wheel detector model path (local file). Ensure it exists.
+# Local model paths
 WHEEL_MODEL_PATH = os.environ.get("WHEEL_MODEL_PATH", "yolo11n.pt")
+VEHICLE_MODEL_PATH = os.environ.get("VEHICLE_MODEL_PATH", "yolo11s.pt")
+
+# Model source in GCS
+MODEL_BUCKET = os.environ.get("MODEL_BUCKET", "adaro-vision-stop-detection")
+WHEEL_MODEL_GCS_OBJECT = os.environ.get("WHEEL_MODEL_GCS_OBJECT", "yolo11n.pt")
+VEHICLE_MODEL_GCS_OBJECT = os.environ.get("VEHICLE_MODEL_GCS_OBJECT", "yolo11s.pt")
 
 # Destination bucket/prefix for processed videos
 DEST_BUCKET = os.environ.get("DEST_BUCKET", "adaro-vision-stop-detection")
@@ -129,6 +135,7 @@ def process_video(local_video_path: Path) -> list[Path]:
         video_name=video_name,
         local_video_path=str(local_video_path),
         wheel_model_path=WHEEL_MODEL_PATH,
+        vehicle_model_path=VEHICLE_MODEL_PATH,
     )
 
     processor.inference()
@@ -192,6 +199,10 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
             raise FileNotFoundError(
                 f"Wheel model not found at '{WHEEL_MODEL_PATH}'. Set WHEEL_MODEL_PATH env or place the file."
             )
+        if not os.path.exists(VEHICLE_MODEL_PATH):
+            raise FileNotFoundError(
+                f"Vehicle model not found at '{VEHICLE_MODEL_PATH}'. Set VEHICLE_MODEL_PATH env or place the file."
+            )
 
         outputs = process_video(local_path)
         print(f"Processing completed for: {local_path}")
@@ -218,6 +229,22 @@ def main() -> None:
         f"Starting subscriber for project='{PROJECT_ID}', subscription='{SUBSCRIPTION_ID}'.\n"
         "Ensure GOOGLE_APPLICATION_CREDENTIALS is set if running outside GCP."
     )
+
+    # Ensure required model weights exist locally; download from GCS if missing
+    try:
+        if not os.path.exists(WHEEL_MODEL_PATH):
+            logging.info(
+                f"Wheel model not found locally at '{WHEEL_MODEL_PATH}'. Downloading from gs://{MODEL_BUCKET}/{WHEEL_MODEL_GCS_OBJECT}"
+            )
+            download_gcs_object(MODEL_BUCKET, WHEEL_MODEL_GCS_OBJECT, Path(WHEEL_MODEL_PATH))
+        if not os.path.exists(VEHICLE_MODEL_PATH):
+            logging.info(
+                f"Vehicle model not found locally at '{VEHICLE_MODEL_PATH}'. Downloading from gs://{MODEL_BUCKET}/{VEHICLE_MODEL_GCS_OBJECT}"
+            )
+            download_gcs_object(MODEL_BUCKET, VEHICLE_MODEL_GCS_OBJECT, Path(VEHICLE_MODEL_PATH))
+    except Exception as e:
+        logging.error(f"Failed to ensure model weights locally: {e}")
+        raise
 
     subscriber = pubsub_v1.SubscriberClient()
     subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)

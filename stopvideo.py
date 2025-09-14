@@ -26,7 +26,7 @@ class StopVideo:
     and analyze if they stop at a designated stop zone.
     It uses YOLOv8 for vehicle detection and a custom YOLO model for wheel detection.
     """
-    def __init__(self, video_name, local_video_path, wheel_model_path):
+    def __init__(self, video_name, local_video_path, wheel_model_path, vehicle_model_path: str = 'yolo11s.pt'):
         """
         Initializes the StopVideo processor.
 
@@ -34,6 +34,7 @@ class StopVideo:
             video_name (str): A name for the video being processed, used for output directories.
             local_video_path (str): The file path to the local video.
             wheel_model_path (str): The file path to the custom-trained wheel detection model (.pt file).
+            vehicle_model_path (str): The file path to the vehicle detection model (.pt file). Defaults to 'yolo11s.pt'.
         """
         self.video_name = video_name
         self.output_path = f"output/{video_name}"
@@ -50,10 +51,9 @@ class StopVideo:
         print(f"Loading wheel detection model from: {wheel_model_path}")
         self.model_wheels = YOLO(wheel_model_path)
         
-        # Load a general-purpose, pre-trained YOLOv8 model for vehicle detection.
-        # The model will be downloaded automatically on first use.
-        print("Loading vehicle detection model (yolo11s.pt)...")
-        self.model_yolo = YOLO('yolo11s.pt') # Corrected from yolo11s.pt to a standard model
+        # Load a general-purpose YOLO model for vehicle detection from the provided path.
+        print(f"Loading vehicle detection model from: {vehicle_model_path}")
+        self.model_yolo = YOLO(vehicle_model_path)
     
         # --- Trackers ---
         # Initialize ByteTrack for tracking both vehicles and wheels.
