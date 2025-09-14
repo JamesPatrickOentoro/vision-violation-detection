@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
+from google.api_core import exceptions as gax_exceptions
 from google.cloud import pubsub_v1
 from google.cloud import storage
 
@@ -178,6 +179,17 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
 
         print(f"New finalized object detected: gs://{bucket}/{object_name}")
 
+        # Compute destination object name upfront and skip if already processed
+        input_stem = Path(object_name).stem
+        dest_filename = f"{input_stem}_processed.mp4"
+        dest_obj = f"{DEST_PREFIX.rstrip('/')}/{dest_filename}"
+        storage_client = storage.Client()
+        dest_blob = storage_client.bucket(DEST_BUCKET).blob(dest_obj)
+        if dest_blob.exists():
+            print(f"Already processed. Skipping: gs://{DEST_BUCKET}/{dest_obj}")
+            message.ack()
+            return
+
         local_path = DOWNLOAD_DIR / Path(object_name).name
         download_gcs_object(bucket, object_name, local_path)
         print(f"Downloaded to: {local_path}")
@@ -204,10 +216,14 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
         print(f"Processing completed for: {local_path}")
 
         # Upload only the advanced output with name <input_stem>_processed.mp4 under processed-videos/
-        input_stem = Path(object_name).stem
-        dest_filename = f"{input_stem}_processed.mp4"
-        dest_obj = f"{DEST_PREFIX.rstrip('/')}/{dest_filename}"
-        upload_file_to_gcs(advanced_out, DEST_BUCKET, dest_obj)
+        # Use precondition to avoid overwriting if another worker already uploaded
+        try:
+            dest_blob.if_generation_match = 0  # create only if not exists
+            dest_blob.content_type = "video/mp4"
+            dest_blob.upload_from_filename(str(advanced_out))
+            print(f"Uploaded {advanced_out} -> gs://{DEST_BUCKET}/{dest_obj}")
+        except gax_exceptions.PreconditionFailed:
+            print(f"Processed file already exists (race). Skipping upload: gs://{DEST_BUCKET}/{dest_obj}")
         message.ack()
     except Exception as e:
         # Let Pub/Sub redeliver by not acking
