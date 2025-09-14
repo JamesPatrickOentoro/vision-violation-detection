@@ -184,6 +184,10 @@ def process_video(local_video_path: Path) -> tuple[Path, Path | None]:
     advanced = output_dir / "inference_advanced.mp4"
     # Remux to faststart for better compatibility
     advanced = faststart_mp4(advanced)
+    # If invalid or empty, force re-encode
+    if not is_valid_video(advanced):
+        logging.warning("Advanced output appears invalid; forcing re-encode to stable MP4")
+        advanced = reencode_mp4(advanced)
     # Generate violations CSV report
     csv_path: Path | None = None
     try:
@@ -237,6 +241,32 @@ def faststart_mp4(input_path: Path) -> Path:
         subprocess.run(cmd, check=True, timeout=300, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if is_valid_video(fixed):
             return fixed
+        return input_path
+    except Exception:
+        return input_path
+
+
+def reencode_mp4(input_path: Path, target_fps: int = 30) -> Path:
+    """Force re-encode MP4 with stable timebase and pixel format to ensure playability."""
+    try:
+        if shutil.which('ffmpeg') is None:
+            return input_path
+        out = input_path.with_name(input_path.stem + "_reenc.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-vf", f"fps={target_fps}",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-an",
+            str(out),
+        ]
+        subprocess.run(cmd, check=True, timeout=900, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if is_valid_video(out):
+            return out
         return input_path
     except Exception:
         return input_path
@@ -408,11 +438,15 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
         advanced_out, csv_path = process_video(local_path)
         print(f"Processing completed for: {local_path}")
 
-        # Validate output video before upload
+        # Validate output video before upload (re-encode was attempted in process_video if needed)
         if not is_valid_video(advanced_out):
-            raise RuntimeError(
-                f"Advanced output invalid or empty: {advanced_out}. Not uploading."
-            )
+            # As a last resort, try a final re-encode here
+            logging.warning("Advanced output still invalid before upload; final re-encode attempt")
+            advanced_out = reencode_mp4(advanced_out)
+            if not is_valid_video(advanced_out):
+                raise RuntimeError(
+                    f"Advanced output invalid or empty after re-encode: {advanced_out}. Not uploading."
+                )
 
         # Upload using helper (names as <input_stem>_processed.<ext>)
         _ = upload_results_to_gcs(
