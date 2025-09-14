@@ -404,6 +404,71 @@ class StopVideo:
                 sink.write_frame(annotated_frame)
         print("Advanced video rendering complete.")
 
+    def render_video_advanced_cv2(self, target_path: str):
+        """Render annotated video using OpenCV VideoWriter, writing frames one-by-one.
+
+        Args:
+            target_path: Full path to the output MP4 file to create.
+        """
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        print(f"Rendering (cv2) advanced video to: {target_path}")
+
+        frames_generator = sv.get_video_frames_generator(source_path=self.local_video_path)
+        fps = getattr(self.video_info, 'fps', 30) or 30
+
+        writer = None
+        frame_count = 0
+        for frame_no, frame in enumerate(tqdm(frames_generator, total=self.video_info.total_frames, desc="Rendering Advanced Video (cv2)")):
+            annotated_frame = frame.copy()
+            annotated_frame = self.stopzone_annotator.annotate(scene=annotated_frame)
+            annotated_frame = self.outzone_annotator.annotate(scene=annotated_frame)
+            annotated_frame = self.road_annotator.annotate(scene=annotated_frame)
+
+            point_x, point_y = self.point
+            cv2.circle(annotated_frame, (int(point_x), int(point_y)), 10, (0, 255, 255), -1)
+
+            if frame_no in self.car_detections:
+                car_detections = self.car_detections[frame_no]
+                car_id = self.get_ids(car_detections)
+
+                if car_id in self.analysis:
+                    car_center = self.get_car_center(frame_no)
+                    if car_center:
+                        cv2.circle(annotated_frame, (int(car_center[0]), int(car_center[1])), 10, (0, 255, 0), -1)
+                        cv2.line(annotated_frame, (int(point_x), int(point_y)), (int(car_center[0]), int(car_center[1])), (0, 255, 0), 2)
+
+                    label = self.add_label(frame_no)
+                    color = self.get_color(label)
+
+                    if color == "green":
+                        annotated_frame = self.label_annotator_green.annotate(annotated_frame, car_detections, labels=label)
+                        annotated_frame = self.box_annotator_green.annotate(annotated_frame, car_detections)
+                    elif color == "red":
+                        annotated_frame = self.label_annotator_red.annotate(annotated_frame, car_detections, labels=label)
+                        annotated_frame = self.box_annotator_red.annotate(annotated_frame, car_detections)
+                    else:
+                        annotated_frame = self.label_annotator_gray.annotate(annotated_frame, car_detections, labels=label)
+                        annotated_frame = self.box_annotator_gray.annotate(annotated_frame, car_detections)
+
+            if frame_no in self.wheel_detections and 'car_id' in locals() and car_id in self.reported_wheels:
+                wheel_detections = self.wheel_detections[frame_no]
+                wheel_detections = self.filter_detections(wheel_detections, self.reported_wheels[car_id])
+                annotated_frame = self.box_annotator_white.annotate(annotated_frame, wheel_detections)
+
+            if writer is None:
+                h, w = annotated_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(target_path, fourcc, fps, (w, h))
+                if not writer.isOpened():
+                    raise RuntimeError("Failed to open VideoWriter for output")
+
+            writer.write(annotated_frame)
+            frame_count += 1
+
+        if writer is not None:
+            writer.release()
+        print(f"Advanced video rendering complete (cv2). Frames written: {frame_count}")
+
     def filter_detections(self, detections, tracker_id):
         """Filters detections to only include a specific tracker ID."""
         if detections is None or len(detections) == 0:

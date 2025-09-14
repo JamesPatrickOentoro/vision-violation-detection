@@ -177,13 +177,15 @@ def process_video(local_video_path: Path) -> tuple[Path, Path | None]:
 
     processor.inference()
     processor.analyze()
-    # Render only the advanced annotated output
-    processor.render_video_advanced()
-    # Path to the advanced output
-    output_dir = Path("output") / video_name
-    advanced = output_dir / "inference_advanced.mp4"
-    # Remux to faststart for better compatibility
-    advanced = faststart_mp4(advanced)
+    # Render only the advanced annotated output to a temporary file via cv2 writer
+    tmp_out = Path("/tmp") / f"{video_name}_annot.mp4"
+    if tmp_out.exists():
+        try:
+            tmp_out.unlink()
+        except Exception:
+            pass
+    processor.render_video_advanced_cv2(str(tmp_out))
+    advanced = faststart_mp4(tmp_out)
     # If invalid or empty, force re-encode
     if not is_valid_video(advanced):
         logging.warning("Advanced output appears invalid; forcing re-encode to stable MP4")
