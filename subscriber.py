@@ -177,24 +177,24 @@ def process_video(local_video_path: Path) -> tuple[Path, Path | None]:
 
     processor.inference()
     processor.analyze()
-    # Render only the advanced annotated output to a temporary file via cv2 writer
-    tmp_out = Path("/tmp") / f"{video_name}_annot.mp4"
+    # Render only the advanced annotated output to a temporary AVI via cv2 writer
+    tmp_out = Path("/tmp") / f"{video_name}_annot.avi"
     if tmp_out.exists():
         try:
             tmp_out.unlink()
         except Exception:
             pass
     processor.render_video_advanced_cv2(str(tmp_out))
-    # Always produce a stable H.264 MP4 with yuv420p and +faststart for web preview
-    advanced = reencode_mp4(tmp_out)
-    # If invalid or empty, force re-encode
+    advanced = tmp_out
+    # Validate; if invalid try to re-encode to MJPEG AVI via ffmpeg
     if not is_valid_video(advanced):
-        logging.warning("Advanced output appears invalid; forcing re-encode to stable MP4")
-        advanced = reencode_mp4(advanced)
+        logging.warning("Annotated AVI appears invalid; forcing re-encode to MJPEG AVI")
+        advanced = reencode_avi(advanced)
     # Generate violations CSV report
     csv_path: Path | None = None
     try:
         fps = float(processor.video_info.fps) if processor.video_info and processor.video_info.fps else None
+        output_dir = Path("output") / video_name
         csv_path = output_dir / f"{video_name}_stop_detection_report.csv"
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with csv_path.open("w", newline="") as f:
@@ -264,6 +264,29 @@ def reencode_mp4(input_path: Path, target_fps: int = 30) -> Path:
             "-crf", "23",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
+            "-an",
+            str(out),
+        ]
+        subprocess.run(cmd, check=True, timeout=900, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if is_valid_video(out):
+            return out
+        return input_path
+    except Exception:
+        return input_path
+
+
+def reencode_avi(input_path: Path, target_fps: int = 30) -> Path:
+    """Re-encode to AVI (MJPEG) to ensure valid container when writer output is problematic."""
+    try:
+        if shutil.which('ffmpeg') is None:
+            return input_path
+        out = input_path.with_name(input_path.stem + "_reenc.avi")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-vf", f"fps={target_fps}",
+            "-c:v", "mjpeg",
+            "-qscale:v", "5",
             "-an",
             str(out),
         ]

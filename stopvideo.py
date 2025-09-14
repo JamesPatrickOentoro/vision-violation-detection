@@ -457,7 +457,12 @@ class StopVideo:
 
             if writer is None:
                 h, w = annotated_frame.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                ext = os.path.splitext(target_path)[1].lower()
+                if ext == '.avi':
+                    # MJPG is broadly supported for AVI in OpenCV
+                    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                else:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 writer = cv2.VideoWriter(target_path, fourcc, fps, (w, h))
                 if not writer.isOpened():
                     raise RuntimeError("Failed to open VideoWriter for output")
