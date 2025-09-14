@@ -22,6 +22,7 @@ env/
 # Outputs and artifacts
 output/
 first_frames/
+downloads/
 
 # Large media
 *.mp4

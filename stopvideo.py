@@ -52,8 +52,8 @@ class StopVideo:
         
         # Load a general-purpose, pre-trained YOLOv8 model for vehicle detection.
         # The model will be downloaded automatically on first use.
-        print("Loading vehicle detection model (yolov11s.pt)...")
-        self.model_yolo = YOLO('yolov11s.pt') # Corrected from yolo11s.pt to a standard model
+        print("Loading vehicle detection model (yolo11s.pt)...")
+        self.model_yolo = YOLO('yolo11s.pt') # Corrected from yolo11s.pt to a standard model
     
         # --- Trackers ---
         # Initialize ByteTrack for tracking both vehicles and wheels.
