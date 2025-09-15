@@ -19,6 +19,8 @@ from stopvideo import StopVideo
 # Configuration via environment variables with sensible defaults
 PROJECT_ID = os.environ.get("PROJECT_ID", "adaro-vision-poc")
 SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID", "adaro-stop-detection-sub")
+# Only handle notifications from this source bucket
+SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "vision-poc-bucket-adaro")
 # Local model paths
 WHEEL_MODEL_PATH = os.environ.get("WHEEL_MODEL_PATH", "yolo11n.pt")
 VEHICLE_MODEL_PATH = os.environ.get("VEHICLE_MODEL_PATH", "yolo11s.pt")
@@ -486,6 +488,12 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
 
         if not bucket or not object_name:
             print("Skipping message without bucket/name fields")
+            message.ack()
+            return
+
+        # Gate by expected source bucket to avoid processing unexpected notifications
+        if bucket != SOURCE_BUCKET:
+            print(f"Skipping message from non-source bucket '{bucket}'. Expected '{SOURCE_BUCKET}'.")
             message.ack()
             return
 
