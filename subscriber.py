@@ -33,7 +33,8 @@ DEST_BUCKET = os.environ.get("DEST_BUCKET", "adaro-vision-stop-detection")
 DEST_PREFIX = os.environ.get("DEST_PREFIX", "processed-videos/")
 
 # Screenshot destination for violation frames
-SCREENSHOT_BUCKET = os.environ.get("SCREENSHOT_BUCKET", "adaro-vision-range-detection")
+# Default bucket updated per request: adaro-vision-stop-detection/screenshoot
+SCREENSHOT_BUCKET = os.environ.get("SCREENSHOT_BUCKET", "adaro-vision-stop-detection")
 SCREENSHOT_PREFIX = os.environ.get("SCREENSHOT_PREFIX", "screenshoot/")
 
 # Directory to place downloaded videos
