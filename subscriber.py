@@ -32,6 +32,10 @@ VEHICLE_MODEL_GCS_OBJECT = os.environ.get("VEHICLE_MODEL_GCS_OBJECT", "yolo11s.p
 DEST_BUCKET = os.environ.get("DEST_BUCKET", "adaro-vision-stop-detection")
 DEST_PREFIX = os.environ.get("DEST_PREFIX", "processed-videos/")
 
+# Screenshot destination for violation frames
+SCREENSHOT_BUCKET = os.environ.get("SCREENSHOT_BUCKET", "adaro-vision-range-detection")
+SCREENSHOT_PREFIX = os.environ.get("SCREENSHOT_PREFIX", "screenshoot/")
+
 # Directory to place downloaded videos
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -190,24 +194,50 @@ def process_video(local_video_path: Path) -> tuple[Path, Path | None]:
     if not is_valid_video(advanced):
         logging.warning("Annotated AVI appears invalid; forcing re-encode to MJPEG AVI")
         advanced = reencode_avi(advanced)
-    # Generate violations CSV report
+    # Generate violations CSV report with: car_id, status, time(minute), screenshot(gs path)
     csv_path: Path | None = None
     try:
-        fps = float(processor.video_info.fps) if processor.video_info and processor.video_info.fps else None
+        fps = float(processor.video_info.fps) if processor.video_info and processor.video_info.fps else 30.0
         output_dir = Path("output") / video_name
         csv_path = output_dir / f"{video_name}_stop_detection_report.csv"
         csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Prepare to read annotated video and capture screenshots
+        cap = cv2.VideoCapture(str(advanced))
         with csv_path.open("w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["car_id", "status", "first_frame", "last_frame", "first_time_s", "last_time_s"])
+            writer.writerow(["car_id", "status", "time", "screenshot"])  # simplified schema
             for car_id, data in (processor.analysis or {}).items():
                 status = data.get("Status")
-                if status and "Failed" in status:
-                    first_f = processor.first_last_frames.get(car_id, {}).get("first")
-                    last_f = processor.first_last_frames.get(car_id, {}).get("last")
-                    first_t = (first_f / fps) if (fps and first_f is not None) else None
-                    last_t = (last_f / fps) if (fps and last_f is not None) else None
-                    writer.writerow([car_id, status, first_f, last_f, first_t, last_t])
+                if not status or "Failed" not in status:
+                    continue
+                # Frame when failure determined
+                frame_idx = processor.car_left_zone.get(car_id)
+                if frame_idx is None:
+                    continue
+                minute_mark = int((frame_idx / fps) // 60)
+
+                # Extract frame from annotated video
+                screenshot_path = None
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        local_ss = Path("/tmp") / f"{video_name}_car{car_id}_frame{frame_idx}.jpg"
+                        try:
+                            cv2.imwrite(str(local_ss), frame)
+                            # Upload screenshot to GCS
+                            ss_name = local_ss.name
+                            ss_dest = f"{SCREENSHOT_PREFIX.rstrip('/')}/{ss_name}"
+                            _upload_ok = upload_file_to_gcs_verified(local_ss, SCREENSHOT_BUCKET, ss_dest)
+                            if _upload_ok:
+                                screenshot_path = f"gs://{SCREENSHOT_BUCKET}/{ss_dest}"
+                        except Exception as e:
+                            logging.error(f"Failed to save/upload screenshot: {e}")
+
+                writer.writerow([car_id, "Failed to stop", minute_mark, screenshot_path or ""])
+
+        cap.release()
     except Exception as e:
         logging.error(f"Failed to generate violations CSV: {e}")
         csv_path = None
@@ -326,6 +356,8 @@ def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_pat
                 content_type = (
                     'video/mp4' if filepath.endswith('.mp4') else
                     'video/x-msvideo' if filepath.endswith('.avi') else
+                    'image/jpeg' if filepath.endswith('.jpg') or filepath.endswith('.jpeg') else
+                    'image/png' if filepath.endswith('.png') else
                     'text/csv' if filepath.endswith('.csv') else
                     'application/octet-stream'
                 )
@@ -384,6 +416,54 @@ def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_pat
             )
         logging.error(f"Error uploading results: {e}")
         return False
+
+
+def upload_file_to_gcs_verified(local_path: Path, bucket_name: str, dest_object: str, max_retries: int = 3) -> bool:
+    """Upload a single file with retries + size verification. Returns True on success."""
+    storage_client = create_storage_client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(dest_object)
+
+    # Inner helpers duplicated to keep function independent
+    def verify_upload(b: storage.Blob, path: str) -> bool:
+        if not b.exists():
+            return False
+        try:
+            b.reload()
+        except Exception:
+            pass
+        local_size = os.path.getsize(path)
+        remote_size = int(getattr(b, 'size', 0) or 0)
+        return remote_size == local_size and remote_size > 0
+
+    blob.chunk_size = 8 * 1024 * 1024
+    for attempt in range(max_retries):
+        try:
+            # Content type
+            name = str(local_path)
+            content_type = (
+                'video/mp4' if name.endswith('.mp4') else
+                'video/x-msvideo' if name.endswith('.avi') else
+                'image/jpeg' if name.endswith('.jpg') or name.endswith('.jpeg') else
+                'image/png' if name.endswith('.png') else
+                'text/csv' if name.endswith('.csv') else
+                'application/octet-stream'
+            )
+            blob.content_type = content_type
+            blob.metadata = {
+                'uploaded_by': 'stop_detection_system',
+                'upload_timestamp': datetime.now().isoformat(),
+                'original_filename': os.path.basename(name),
+            }
+            blob.upload_from_filename(str(local_path))
+            if verify_upload(blob, str(local_path)):
+                return True
+            logging.warning(f"Verification failed for {dest_object}, attempt {attempt+1}/{max_retries}")
+        except Exception as e:
+            logging.warning(f"Upload attempt {attempt+1} failed for {dest_object}: {e}")
+            if attempt == max_retries - 1:
+                return False
+    return False
 
 
 def upload_file_to_gcs(src_path: Path, bucket_name: str, dest_object: str) -> None:
