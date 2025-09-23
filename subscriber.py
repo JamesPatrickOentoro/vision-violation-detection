@@ -233,29 +233,51 @@ def process_video(local_video_path: Path) -> tuple[None, Path | None]:
                 logging.error(f"Failed to capture annotated screenshot: {e}")
                 return False
 
+        def format_timestamp_from_frame(frame_idx: int, fps_value: float, total_frames: Optional[int]) -> str:
+            """Convert a frame index to an HH:MM:SS.mmm string clamped to video bounds."""
+            if fps_value <= 0:
+                fps_value = 30.0
+            if total_frames and total_frames > 0:
+                max_frame_index = max(total_frames - 1, 0)
+                frame_idx = max(0, min(frame_idx, max_frame_index))
+            else:
+                frame_idx = max(0, frame_idx)
+
+            total_millis = int(round((frame_idx / fps_value) * 1000))
+            if total_frames and total_frames > 0:
+                max_millis = int(round(((total_frames - 1) / fps_value) * 1000))
+                total_millis = max(0, min(total_millis, max_millis))
+
+            hours, remainder = divmod(total_millis, 3_600_000)
+            minutes, remainder = divmod(remainder, 60_000)
+            seconds, milliseconds = divmod(remainder, 1_000)
+            return f"{hours}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+        processing_date = datetime.utcnow().date().isoformat()
+        video_filename = Path(processor.local_video_path).name
+        total_frames = getattr(processor.video_info, "total_frames", None)
+
         with csv_path.open("w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["car_id", "status", "time", "screenshot"])  # simplified schema
+            writer.writerow(["Date", "Video Name", "Timestamp On Video (ms)", "Vehicle ID", "Did violate"])
             for car_id, data in (processor.analysis or {}).items():
                 status = data.get("Status")
-                if not status or "Failed" not in status:
+                if status != "Failed to stop":
                     continue
-                # Frame when failure determined
                 frame_idx = processor.car_left_zone.get(car_id)
                 if frame_idx is None:
                     continue
-                minute_mark = int((frame_idx / fps) // 60)
+
+                timestamp_str = format_timestamp_from_frame(frame_idx, fps, total_frames)
 
                 # Extract and upload annotated screenshot directly from the source video
                 local_ss = Path("/tmp") / f"{video_name}_car{car_id}_frame{frame_idx}.jpg"
-                screenshot_path = None
                 if capture_annotated_screenshot(frame_idx, local_ss, car_id):
                     ss_name = local_ss.name
                     ss_dest = f"{SCREENSHOT_PREFIX.rstrip('/')}/{ss_name}"
-                    _upload_ok = upload_file_to_gcs_verified(local_ss, SCREENSHOT_BUCKET, ss_dest)
-                    if _upload_ok:
-                        screenshot_path = f"gs://{SCREENSHOT_BUCKET}/{ss_dest}"
-                writer.writerow([car_id, "Failed to stop", minute_mark, screenshot_path or ""])
+                    upload_file_to_gcs_verified(local_ss, SCREENSHOT_BUCKET, ss_dest)
+
+                writer.writerow([processing_date, video_filename, timestamp_str, car_id, "Yes"])
     except Exception as e:
         logging.error(f"Failed to generate violations CSV: {e}")
         csv_path = None
