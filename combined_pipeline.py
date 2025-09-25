@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
@@ -399,7 +400,7 @@ def process_video_combined(
     output_dir = Path(stop_processor.output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = output_dir / f"{video_name}_detection_report.csv"
+    csv_path = output_dir / f"{video_name}_vision_detection_report.csv"
     rows.sort(key=lambda item: item[0])
 
     with csv_path.open("w", newline="") as f:
