@@ -1,4 +1,5 @@
 import csv
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,20 +28,23 @@ from contraflow.detector import ContraflowDetector
 from stopvideo import StopVideo
 
 
+SPEED_LIMIT_KMH = float(os.environ.get("SPEED_LIMIT_KMH", "20"))
+SPEED_SMOOTHING_FRAMES = int(os.environ.get("SPEED_SMOOTHING_FRAMES", "7"))
+PIXELS_PER_METER = float(os.environ.get("PIXELS_PER_METER", "9.12"))
+HOMOGRAPHY_MATRIX_PATH = os.environ.get("HOMOGRAPHY_MATRIX_PATH", "homography.npy")
+RANGE_THRESHOLD_METERS = float(os.environ.get("RANGE_THRESHOLD_METERS", "10"))
+
+
 @dataclass
 class ContraflowDetection:
     track_id: int
     bbox: Tuple[int, int, int, int]
     is_contraflow: bool
     lane: Optional[int]
-
-
-@dataclass
-class ContraflowProcessingResult:
-    frame_detections: Dict[int, List[ContraflowDetection]]
-    events: List[Dict[str, int]]
-    fps: float
-    total_frames: int
+    speed_kmh: float
+    speed_violation: bool
+    center: Tuple[int, int]
+    projected_point: np.ndarray
 
 
 @dataclass
@@ -48,7 +52,16 @@ class ScreenshotArtifact:
     path: Path
     frame_idx: int
     violation_type: str
-    vehicle_id: int
+    vehicle_id: str
+
+
+@dataclass
+class RangeViolation:
+    track_id_a: int
+    track_id_b: int
+    distance_m: float
+    point_a: Tuple[int, int]
+    point_b: Tuple[int, int]
 
 
 @dataclass
@@ -58,6 +71,18 @@ class CombinedArtifacts:
     screenshots: List[ScreenshotArtifact]
 
 
+@dataclass
+class ContraflowProcessingResult:
+    frame_detections: Dict[int, List[ContraflowDetection]]
+    events: List[Dict[str, float | int | str]]
+    fps: float
+    total_frames: int
+    range_pairs: Dict[int, List[RangeViolation]]
+
+
+logger = logging.getLogger(__name__)
+
+
 class ContraflowSequentialProcessor:
     """Sequential contraflow detector used for the combined pipeline."""
 
@@ -65,6 +90,10 @@ class ContraflowSequentialProcessor:
         self.detector = ContraflowDetector()
         self.device = self._select_device()
         self.model = YOLO(self._resolve_model_path())
+        self.homography = self._load_homography()
+        self.speed_history: Dict[int, List[np.ndarray]] = {}
+        self.logged_speed_ids: set[int] = set()
+        self.range_events_logged: set[Tuple[int, int]] = set()
 
     def _select_device(self) -> str:
         if torch is not None and torch.cuda.is_available():
@@ -83,6 +112,50 @@ class ContraflowSequentialProcessor:
         # Final fallback lets Ultralytics handle model download if needed
         return "yolo11n.pt"
 
+    def _load_homography(self) -> Optional[np.ndarray]:
+        if not HOMOGRAPHY_MATRIX_PATH:
+            return None
+        try:
+            matrix_path = Path(HOMOGRAPHY_MATRIX_PATH)
+            if matrix_path.exists():
+                return np.load(str(matrix_path))
+        except Exception:
+            pass
+        return None
+
+    def _project_point(self, point: Tuple[float, float]) -> np.ndarray:
+        src = np.array([[point]], dtype=np.float32)
+        if self.homography is not None:
+            try:
+                dst = cv2.perspectiveTransform(src, self.homography)[0][0]
+                return dst.astype(np.float32)
+            except Exception:
+                pass
+        return src[0][0].astype(np.float32)
+
+    def _compute_range_violations(self, detections: List[ContraflowDetection]) -> List[RangeViolation]:
+        violations: List[RangeViolation] = []
+        for i in range(len(detections)):
+            det_a = detections[i]
+            for j in range(i + 1, len(detections)):
+                det_b = detections[j]
+                delta = det_a.projected_point - det_b.projected_point
+                distance_pixels = float(np.linalg.norm(delta))
+                if PIXELS_PER_METER <= 0:
+                    continue
+                distance_m = distance_pixels / PIXELS_PER_METER
+                if distance_m < RANGE_THRESHOLD_METERS:
+                    violations.append(
+                        RangeViolation(
+                            track_id_a=det_a.track_id,
+                            track_id_b=det_b.track_id,
+                            distance_m=distance_m,
+                            point_a=(det_a.center[0], det_a.center[1]),
+                            point_b=(det_b.center[0], det_b.center[1]),
+                        )
+                    )
+        return violations
+
     def process(self, video_path: Path) -> ContraflowProcessingResult:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -93,7 +166,11 @@ class ContraflowSequentialProcessor:
         self.detector.reset()
 
         frame_map: Dict[int, List[ContraflowDetection]] = {}
-        events: List[Dict[str, int]] = []
+        events: List[Dict[str, float | int | str]] = []
+        self.speed_history.clear()
+        self.logged_speed_ids.clear()
+        self.range_events_logged.clear()
+        range_pairs: Dict[int, List[RangeViolation]] = {}
 
         frame_idx = 0
         while True:
@@ -136,18 +213,53 @@ class ContraflowSequentialProcessor:
                 is_contraflow = self.detector.is_contraflow(track_id, center_point)
                 lane = self.detector.vehicle_assigned_lane.get(track_id)
 
+                ground_point = ((x1 + x2) / 2.0, y2)
+                projected_point = self._project_point(ground_point)
+                history = self.speed_history.setdefault(track_id, [])
+                history.append(projected_point)
+                if len(history) > SPEED_SMOOTHING_FRAMES * 5:
+                    history.pop(0)
+
+                speed_kmh = 0.0
+                speed_violation = False
+                if fps > 0 and len(history) > SPEED_SMOOTHING_FRAMES:
+                    delta_vec = history[-1] - history[-SPEED_SMOOTHING_FRAMES]
+                    distance_pixels = float(np.linalg.norm(delta_vec))
+                    distance_meters = distance_pixels / PIXELS_PER_METER if PIXELS_PER_METER > 0 else 0.0
+                    time_seconds = SPEED_SMOOTHING_FRAMES / fps
+                    if time_seconds > 0:
+                        speed_kmh = (distance_meters / time_seconds) * 3.6
+                        speed_violation = speed_kmh > SPEED_LIMIT_KMH
+
+                if speed_violation and track_id not in self.logged_speed_ids:
+                    events.append(
+                        {
+                            "type": "speed",
+                            "frame_idx": frame_idx,
+                            "track_id": track_id,
+                            "timestamp_ms": timestamp_ms,
+                            "speed_kmh": speed_kmh,
+                        }
+                    )
+                    self.logged_speed_ids.add(track_id)
+
                 detections.append(
                     ContraflowDetection(
                         track_id=track_id,
                         bbox=(x1, y1, x2, y2),
                         is_contraflow=is_contraflow,
                         lane=lane,
+                        speed_kmh=speed_kmh,
+                        speed_violation=speed_violation,
+                        center=(int(center_x), int(center_y)),
+                        projected_point=projected_point,
                     )
                 )
 
                 if is_contraflow and self.detector.should_log_contraflow(track_id):
                     events.append(
                         {
+                            "type": "contraflow",
                             "frame_idx": frame_idx,
                             "track_id": track_id,
                             "timestamp_ms": timestamp_ms,
@@ -156,6 +268,22 @@ class ContraflowSequentialProcessor:
 
             if detections:
                 frame_map[frame_idx] = detections
+                range_list = self._compute_range_violations(detections)
+                if range_list:
+                    range_pairs[frame_idx] = range_list
+                    for violation in range_list:
+                        pair_key = tuple(sorted((violation.track_id_a, violation.track_id_b)))
+                        if pair_key not in self.range_events_logged:
+                            self.range_events_logged.add(pair_key)
+                            events.append(
+                                {
+                                    "type": "range",
+                                    "frame_idx": frame_idx,
+                                    "track_pair": f"{violation.track_id_a}-{violation.track_id_b}",
+                                    "timestamp_ms": timestamp_ms,
+                                    "distance_m": violation.distance_m,
+                                }
+                            )
 
             frame_idx += 1
 
@@ -166,6 +294,7 @@ class ContraflowSequentialProcessor:
             events=events,
             fps=fps,
             total_frames=total_frames,
+            range_pairs=range_pairs,
         )
 
 
@@ -229,6 +358,7 @@ def _annotate_stop_detection(frame: np.ndarray, frame_idx: int, processor: StopV
 def _draw_contraflow_annotations(
     frame: np.ndarray,
     detections: List[ContraflowDetection],
+    range_pairs: Optional[List[RangeViolation]] = None,
 ) -> np.ndarray:
     annotated = frame.copy()
 
@@ -247,18 +377,53 @@ def _draw_contraflow_annotations(
 
         lane_text = f"L{detection.lane}" if detection.lane else "L?"
         label = f"#{detection.track_id} {lane_text} {status}"
+        speed_label = f"{detection.speed_kmh:.1f} km/h"
+        speed_color = (0, 0, 255) if detection.speed_violation else (255, 255, 255)
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
+        text_y = max(y1 - 15, 20)
         cv2.putText(
             annotated,
             label,
-            (x1, max(y1 - 10, 15)),
+            (x1, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             (255, 255, 255),
             1,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            annotated,
+            speed_label,
+            (x1, text_y + 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            speed_color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    if range_pairs:
+        for violation in range_pairs:
+            cv2.line(
+                annotated,
+                violation.point_a,
+                violation.point_b,
+                (0, 0, 255),
+                2,
+            )
+            mid_x = int((violation.point_a[0] + violation.point_b[0]) / 2)
+            mid_y = int((violation.point_a[1] + violation.point_b[1]) / 2)
+            cv2.putText(
+                annotated,
+                f"{violation.distance_m:.2f} m",
+                (mid_x, max(mid_y - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     return annotated
 
@@ -268,14 +433,12 @@ def _annotate_combined_frame(
     frame_idx: int,
     stop_processor: StopVideo,
     contraflow_frames: Dict[int, List[ContraflowDetection]],
+    range_frames: Dict[int, List[RangeViolation]],
 ) -> np.ndarray:
     annotated = _annotate_stop_detection(frame, frame_idx, stop_processor)
     contraflow_detections = contraflow_frames.get(frame_idx, [])
-    if contraflow_detections:
-        annotated = _draw_contraflow_annotations(annotated, contraflow_detections)
-    else:
-        # Ensure lane overlays are still visible even without detections
-        annotated = _draw_contraflow_annotations(annotated, [])
+    range_detections = range_frames.get(frame_idx)
+    annotated = _draw_contraflow_annotations(annotated, contraflow_detections, range_detections)
     return annotated
 
 
@@ -285,6 +448,7 @@ def _capture_combined_screenshot(
     destination: Path,
     stop_processor: StopVideo,
     contraflow_frames: Dict[int, List[ContraflowDetection]],
+    range_frames: Dict[int, List[RangeViolation]],
 ) -> bool:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -296,23 +460,31 @@ def _capture_combined_screenshot(
     if not success or frame is None:
         return False
 
-    annotated = _annotate_combined_frame(frame, frame_idx, stop_processor, contraflow_frames)
+    annotated = _annotate_combined_frame(frame, frame_idx, stop_processor, contraflow_frames, range_frames)
     return cv2.imwrite(str(destination), annotated)
 
 
 def _render_combined_video(
     stop_processor: StopVideo,
     contraflow_frames: Dict[int, List[ContraflowDetection]],
+    range_frames: Dict[int, List[RangeViolation]],
     output_path: Path,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    video_info = stop_processor.video_info
-
-    with sv.VideoSink(target_path=str(output_path), video_info=video_info) as sink:
-        frames_generator = sv.get_video_frames_generator(source_path=stop_processor.local_video_path)
-        for frame_idx, frame in enumerate(frames_generator):
-            annotated = _annotate_combined_frame(frame, frame_idx, stop_processor, contraflow_frames)
-            sink.write_frame(annotated)
+    fps = float(stop_processor.video_info.fps or 30.0)
+    frames_generator = sv.get_video_frames_generator(source_path=stop_processor.local_video_path)
+    writer = None
+    for frame_idx, frame in enumerate(frames_generator):
+        annotated = _annotate_combined_frame(frame, frame_idx, stop_processor, contraflow_frames, range_frames)
+        if writer is None:
+            h, w = annotated.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+            if not writer.isOpened():
+                raise RuntimeError("Failed to open VideoWriter for combined output")
+        writer.write(annotated)
+    if writer is not None:
+        writer.release()
 
 
 def process_video_combined(
@@ -330,10 +502,13 @@ def process_video_combined(
     )
 
     stop_processor.inference()
+    logger.info("Stop detection inference complete; running stop analysis...")
     stop_processor.analyze()
+    logger.info("Stop analysis complete; starting contraflow and speed processing...")
 
     contraflow_processor = ContraflowSequentialProcessor()
     contraflow_result = contraflow_processor.process(local_video_path)
+    logger.info("Contraflow and speed processing complete; preparing combined outputs...")
 
     fps = float(stop_processor.video_info.fps or contraflow_result.fps or 30.0)
     total_frames = contraflow_result.total_frames or getattr(stop_processor.video_info, "total_frames", 0) or 0
@@ -343,7 +518,7 @@ def process_video_combined(
     video_filename = Path(stop_processor.local_video_path).name
     screenshot_dir.mkdir(parents=True, exist_ok=True)
 
-    rows: List[Tuple[int, Tuple[str, str, str, int, str]]] = []
+    rows: List[Tuple[int, Tuple[str, str, str, str, str]]] = []
     screenshots: List[ScreenshotArtifact] = []
 
     for car_id, data in (stop_processor.analysis or {}).items():
@@ -355,7 +530,7 @@ def process_video_combined(
             continue
 
         timestamp_str = _format_timestamp_from_frame(frame_idx, fps, total_frames)
-        rows.append((frame_idx, (processing_date, video_filename, timestamp_str, car_id, "stop violation")))
+        rows.append((frame_idx, (processing_date, video_filename, timestamp_str, str(car_id), "stop violation")))
 
         screenshot_path = screenshot_dir / f"{video_name}_stop_id{car_id}_frame{frame_idx}.jpg"
         if _capture_combined_screenshot(
@@ -364,36 +539,53 @@ def process_video_combined(
             screenshot_path,
             stop_processor,
             contraflow_result.frame_detections,
+            contraflow_result.range_pairs,
         ):
             screenshots.append(
                 ScreenshotArtifact(
                     path=screenshot_path,
                     frame_idx=frame_idx,
                     violation_type="stop violation",
-                    vehicle_id=car_id,
+                    vehicle_id=str(car_id),
                 )
             )
 
     for event in contraflow_result.events:
-        frame_idx = event["frame_idx"]
-        track_id = event["track_id"]
+        frame_idx = int(event.get("frame_idx", 0))
+        event_type = event.get("type", "contraflow")
         timestamp_str = _format_timestamp_from_frame(frame_idx, fps, total_frames)
-        rows.append((frame_idx, (processing_date, video_filename, timestamp_str, track_id, "contraflow violation")))
 
-        screenshot_path = screenshot_dir / f"{video_name}_contraflow_id{track_id}_frame{frame_idx}.jpg"
+        if event_type == "speed":
+            track_id = str(event.get("track_id", "-1"))
+            rows.append((frame_idx, (processing_date, video_filename, timestamp_str, track_id, "speed violation")))
+            screenshot_path = screenshot_dir / f"{video_name}_speed_id{track_id}_frame{frame_idx}.jpg"
+            violation_label = "speed violation"
+        elif event_type == "range":
+            track_pair = str(event.get("track_pair", "unknown"))
+            rows.append((frame_idx, (processing_date, video_filename, timestamp_str, track_pair, "range violation")))
+            sanitized = track_pair.replace('/', '-').replace(':', '-')
+            screenshot_path = screenshot_dir / f"{video_name}_range_{sanitized}_frame{frame_idx}.jpg"
+            violation_label = "range violation"
+        else:
+            track_id = str(event.get("track_id", "-1"))
+            rows.append((frame_idx, (processing_date, video_filename, timestamp_str, track_id, "contraflow violation")))
+            screenshot_path = screenshot_dir / f"{video_name}_contraflow_id{track_id}_frame{frame_idx}.jpg"
+            violation_label = "contraflow violation"
+
         if _capture_combined_screenshot(
             local_video_path,
             frame_idx,
             screenshot_path,
             stop_processor,
             contraflow_result.frame_detections,
+            contraflow_result.range_pairs,
         ):
             screenshots.append(
                 ScreenshotArtifact(
                     path=screenshot_path,
                     frame_idx=frame_idx,
-                    violation_type="contraflow violation",
-                    vehicle_id=track_id,
+                    violation_type=violation_label,
+                    vehicle_id=track_pair if event_type == "range" else track_id,
                 )
             )
 
@@ -409,8 +601,10 @@ def process_video_combined(
         for _, row in rows:
             writer.writerow(row)
 
-    combined_video_path = output_dir / "inference_combined.mp4"
-    _render_combined_video(stop_processor, contraflow_result.frame_detections, combined_video_path)
+    combined_video_path = output_dir / "inference_combined.avi"
+    logger.info("Rendering combined annotated video...")
+    _render_combined_video(stop_processor, contraflow_result.frame_detections, contraflow_result.range_pairs, combined_video_path)
+    logger.info("Combined video rendering finished.")
 
     return CombinedArtifacts(
         video_path=combined_video_path,
