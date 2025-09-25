@@ -1,20 +1,17 @@
 import os
-import csv
 import json
 import shutil
 import subprocess
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import cv2
-import supervision as sv
 from google.api_core import exceptions as gax_exceptions
 from google.cloud import pubsub_v1
 from google.cloud import storage
 
-from stopvideo import StopVideo
+from combined_pipeline import CombinedArtifacts, process_video_combined
 
 
 # Configuration via environment variables with sensible defaults
@@ -31,13 +28,14 @@ MODEL_BUCKET = os.environ.get("MODEL_BUCKET", "adaro-vision-stop-detection")
 WHEEL_MODEL_GCS_OBJECT = os.environ.get("WHEEL_MODEL_GCS_OBJECT", "yolo11n.pt")
 VEHICLE_MODEL_GCS_OBJECT = os.environ.get("VEHICLE_MODEL_GCS_OBJECT", "yolo11s.pt")
 
-# Destination bucket/prefix for processed videos
-DEST_BUCKET = os.environ.get("DEST_BUCKET", "adaro-vision-stop-detection")
+# Destination bucket/prefix for processed results
+DEST_BUCKET = os.environ.get("DEST_BUCKET", "adaro-vision-results")
 DEST_PREFIX = os.environ.get("DEST_PREFIX", "processed-videos/")
+REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "detection-reports/")
 
 # Screenshot destination for violation frames
-# Default bucket updated per request: adaro-vision-stop-detection/screenshoot
-SCREENSHOT_BUCKET = os.environ.get("SCREENSHOT_BUCKET", "adaro-vision-stop-detection")
+# Default bucket updated per request: adaro-vision-results/screenshoot
+SCREENSHOT_BUCKET = os.environ.get("SCREENSHOT_BUCKET", "adaro-vision-results")
 SCREENSHOT_PREFIX = os.environ.get("SCREENSHOT_PREFIX", "screenshoot/")
 
 # Directory to place downloaded videos
@@ -174,114 +172,16 @@ def is_video_path(path: str) -> bool:
     return ext in {".mp4", ".avi", ".mov", ".mkv"}
 
 
-def process_video(local_video_path: Path) -> tuple[None, Path | None]:
+def run_combined_detection(local_video_path: Path) -> CombinedArtifacts:
     video_name = local_video_path.stem
-    processor = StopVideo(
+    screenshot_base = Path("/tmp") / f"{video_name}_combined_screens"
+    return process_video_combined(
         video_name=video_name,
-        local_video_path=str(local_video_path),
+        local_video_path=local_video_path,
         wheel_model_path=WHEEL_MODEL_PATH,
         vehicle_model_path=VEHICLE_MODEL_PATH,
+        screenshot_dir=screenshot_base,
     )
-
-    processor.inference()
-    processor.analyze()
-    # Generate violations CSV report with: car_id, status, time(minute), screenshot(gs path)
-    csv_path: Path | None = None
-    try:
-        fps = float(processor.video_info.fps) if processor.video_info and processor.video_info.fps else 30.0
-        output_dir = Path("output") / video_name
-        csv_path = output_dir / f"{video_name}_stop_detection_report.csv"
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Helper: capture and annotate a single frame at frame_idx, then save screenshot
-        def capture_annotated_screenshot(frame_idx: int, local_ss_path: Path, car_id: int) -> bool:
-            try:
-                frames_generator = sv.get_video_frames_generator(source_path=processor.local_video_path)
-                for idx, frame in enumerate(frames_generator):
-                    if idx == int(frame_idx):
-                        annotated_frame = frame.copy()
-                        annotated_frame = processor.stopzone_annotator.annotate(scene=annotated_frame)
-                        annotated_frame = processor.outzone_annotator.annotate(scene=annotated_frame)
-                        annotated_frame = processor.road_annotator.annotate(scene=annotated_frame)
-
-                        point_x, point_y = processor.point
-                        cv2.circle(annotated_frame, (int(point_x), int(point_y)), 10, (0, 255, 255), -1)
-
-                        if frame_idx in processor.car_detections:
-                            car_detections = processor.car_detections[frame_idx]
-                            label = processor.add_label(frame_idx)
-                            color = processor.get_color(label)
-                            if color == "green":
-                                annotated_frame = processor.label_annotator_green.annotate(annotated_frame, car_detections, labels=label)
-                                annotated_frame = processor.box_annotator_green.annotate(annotated_frame, car_detections)
-                            elif color == "red":
-                                annotated_frame = processor.label_annotator_red.annotate(annotated_frame, car_detections, labels=label)
-                                annotated_frame = processor.box_annotator_red.annotate(annotated_frame, car_detections)
-                            else:
-                                annotated_frame = processor.label_annotator_gray.annotate(annotated_frame, car_detections, labels=label)
-                                annotated_frame = processor.box_annotator_gray.annotate(annotated_frame, car_detections)
-
-                        if frame_idx in processor.wheel_detections and car_id in getattr(processor, 'reported_wheels', {}):
-                            wheel_detections = processor.wheel_detections[frame_idx]
-                            wheel_detections = processor.filter_detections(wheel_detections, processor.reported_wheels[car_id])
-                            annotated_frame = processor.box_annotator_white.annotate(annotated_frame, wheel_detections)
-
-                        cv2.imwrite(str(local_ss_path), annotated_frame)
-                        return True
-                return False
-            except Exception as e:
-                logging.error(f"Failed to capture annotated screenshot: {e}")
-                return False
-
-        def format_timestamp_from_frame(frame_idx: int, fps_value: float, total_frames: Optional[int]) -> str:
-            """Convert a frame index to an HH:MM:SS.mmm string clamped to video bounds."""
-            if fps_value <= 0:
-                fps_value = 30.0
-            if total_frames and total_frames > 0:
-                max_frame_index = max(total_frames - 1, 0)
-                frame_idx = max(0, min(frame_idx, max_frame_index))
-            else:
-                frame_idx = max(0, frame_idx)
-
-            total_millis = int(round((frame_idx / fps_value) * 1000))
-            if total_frames and total_frames > 0:
-                max_millis = int(round(((total_frames - 1) / fps_value) * 1000))
-                total_millis = max(0, min(total_millis, max_millis))
-
-            hours, remainder = divmod(total_millis, 3_600_000)
-            minutes, remainder = divmod(remainder, 60_000)
-            seconds, milliseconds = divmod(remainder, 1_000)
-            return f"{hours}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-
-        processing_date = datetime.utcnow().date().isoformat()
-        video_filename = Path(processor.local_video_path).name
-        total_frames = getattr(processor.video_info, "total_frames", None)
-
-        with csv_path.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Date", "Video Name", "Timestamp On Video (ms)", "Vehicle ID", "Did violate"])
-            for car_id, data in (processor.analysis or {}).items():
-                status = data.get("Status")
-                if status != "Failed to stop":
-                    continue
-                frame_idx = processor.car_left_zone.get(car_id)
-                if frame_idx is None:
-                    continue
-
-                timestamp_str = format_timestamp_from_frame(frame_idx, fps, total_frames)
-
-                # Extract and upload annotated screenshot directly from the source video
-                local_ss = Path("/tmp") / f"{video_name}_car{car_id}_frame{frame_idx}.jpg"
-                if capture_annotated_screenshot(frame_idx, local_ss, car_id):
-                    ss_name = local_ss.name
-                    ss_dest = f"{SCREENSHOT_PREFIX.rstrip('/')}/{ss_name}"
-                    upload_file_to_gcs_verified(local_ss, SCREENSHOT_BUCKET, ss_dest)
-
-                writer.writerow([processing_date, video_filename, timestamp_str, car_id, "Yes"])
-    except Exception as e:
-        logging.error(f"Failed to generate violations CSV: {e}")
-        csv_path = None
-    return None, csv_path
 
 
 def is_valid_video(video_path: Path) -> bool:
@@ -434,13 +334,15 @@ def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_pat
         # Upload processed video
         if output_video_path and os.path.exists(output_video_path):
             file_ext = os.path.splitext(output_video_path)[1]
-            video_blob = bucket.blob(f"processed-videos/{video_name}_processed{file_ext}")
+            video_prefix = DEST_PREFIX.rstrip('/')
+            video_blob = bucket.blob(f"{video_prefix}/{video_name}_processed{file_ext}")
             if not upload_with_retry(video_blob, output_video_path, "video"):
                 raise Exception("Video upload failed after retries")
 
-        # Upload CSV report (optional) under stop-detection-reports/
+        # Upload CSV report (optional) under detection-reports/
         if csv_file_path and os.path.exists(csv_file_path):
-            csv_blob = bucket.blob(f"stop-detection-reports/{video_name}_stop_detection_report.csv")
+            report_prefix = REPORT_PREFIX.rstrip('/')
+            csv_blob = bucket.blob(f"{report_prefix}/{video_name}_detection_report.csv")
             if not upload_with_retry(csv_blob, csv_file_path, "CSV report"):
                 raise Exception("CSV report upload failed after retries")
 
@@ -544,7 +446,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
 
         # Idempotency: skip if report already exists (and non-empty)
         input_stem = Path(object_name).stem
-        report_obj = f"stop-detection-reports/{input_stem}_stop_detection_report.csv"
+        report_obj = f"{REPORT_PREFIX.rstrip('/')}/{input_stem}_detection_report.csv"
         storage_client = storage.Client()
         rep_blob = storage_client.bucket(DEST_BUCKET).blob(report_obj)
         if rep_blob.exists():
@@ -582,16 +484,26 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                 f"Vehicle model not found at '{VEHICLE_MODEL_PATH}'. Set VEHICLE_MODEL_PATH env or place the file."
             )
 
-        advanced_out, csv_path = process_video(local_path)
+        artifacts = run_combined_detection(local_path)
         print(f"Processing completed for: {local_path}")
 
-        # Upload using helper (only CSV; no annotated video upload)
+        video_path_str = str(artifacts.video_path) if artifacts.video_path and artifacts.video_path.exists() else None
+        csv_path_str = str(artifacts.csv_path) if artifacts.csv_path and artifacts.csv_path.exists() else None
+
         _ = upload_results_to_gcs(
             bucket_name=DEST_BUCKET,
-            output_video_path=None,
-            csv_file_path=str(csv_path) if csv_path else None,
+            output_video_path=video_path_str,
+            csv_file_path=csv_path_str,
             video_name=input_stem,
         )
+
+        for screenshot in artifacts.screenshots:
+            dest_object = f"{SCREENSHOT_PREFIX.rstrip('/')}/{screenshot.path.name}"
+            if upload_file_to_gcs_verified(screenshot.path, SCREENSHOT_BUCKET, dest_object):
+                try:
+                    screenshot.path.unlink()
+                except Exception:
+                    pass
         message.ack()
     except Exception as e:
         # Let Pub/Sub redeliver by not acking
