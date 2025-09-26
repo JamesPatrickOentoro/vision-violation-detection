@@ -462,11 +462,12 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                 message.ack()
                 return
 
-        local_path = DOWNLOAD_DIR / Path(object_name).name
-        download_gcs_object(bucket, object_name, local_path)
-        print(f"Downloaded to: {local_path}")
+        local_path_original = DOWNLOAD_DIR / Path(object_name).name
+        download_gcs_object(bucket, object_name, local_path_original)
+        print(f"Downloaded to: {local_path_original}")
 
         # If AVI, convert to MP4 1280x720
+        local_path = local_path_original
         if local_path.suffix.lower() == ".avi":
             mp4_path = local_path.with_suffix(".mp4")
             ok = convert_avi_to_mp4(str(local_path), str(mp4_path))
@@ -504,6 +505,29 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                     screenshot.path.unlink()
                 except Exception:
                     pass
+
+        for path in [artifacts.video_path, artifacts.csv_path]:
+            try:
+                if path and path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+
+        try:
+            if artifacts.work_dir and artifacts.work_dir.exists():
+                shutil.rmtree(artifacts.work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        cleanup_candidates = {local_path}
+        if local_path_original != local_path:
+            cleanup_candidates.add(local_path_original)
+        for candidate in cleanup_candidates:
+            try:
+                if candidate.exists():
+                    candidate.unlink()
+            except Exception:
+                pass
         message.ack()
     except Exception as e:
         # Let Pub/Sub redeliver by not acking

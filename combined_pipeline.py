@@ -69,6 +69,7 @@ class CombinedArtifacts:
     video_path: Path
     csv_path: Path
     screenshots: List[ScreenshotArtifact]
+    work_dir: Path
 
 
 @dataclass
@@ -610,4 +611,5 @@ def process_video_combined(
         video_path=combined_video_path,
         csv_path=csv_path,
         screenshots=screenshots,
+        work_dir=output_dir,
     )
