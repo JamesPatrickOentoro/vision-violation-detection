@@ -8,6 +8,7 @@ tqdm>=4.66.0
 # Google Cloud clients (Pub/Sub + Storage)
 google-cloud-pubsub>=2.19.0
 google-cloud-storage>=2.16.0
+google-cloud-bigquery>=3.11.0
 
 # Optional (used by some scripts / notebooks)
 matplotlib>=3.7.0

@@ -1,19 +1,22 @@
 import os
 import json
+import csv
 import shutil
 import subprocess
 import logging
+import threading
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
 
 import cv2
 from google.api_core import exceptions as gax_exceptions
 from google.cloud import pubsub_v1
 from google.cloud import storage
 from google.cloud.pubsub_v1.subscriber.scheduler import ThreadScheduler
+from google.cloud import bigquery
 
 from combined_pipeline import CombinedArtifacts, process_video_combined
 
@@ -41,6 +44,15 @@ REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "detection-reports/")
 # Default bucket updated per request: adaro-vision-results/screenshoot
 SCREENSHOT_BUCKET = os.environ.get("SCREENSHOT_BUCKET", "adaro-vision-results")
 SCREENSHOT_PREFIX = os.environ.get("SCREENSHOT_PREFIX", "screenshoot/")
+
+# BigQuery destinations for structured reporting
+BQ_PROJECT_ID = os.environ.get("BQ_PROJECT_ID", PROJECT_ID)
+BQ_DATASET = os.environ.get("BQ_DATASET", "vision_result")
+BQ_TABLE = os.environ.get("BQ_TABLE", "vision_reports")
+BQ_LOCATION = os.environ.get("BQ_LOCATION", "asia-southeast1")
+BQ_TABLE_ID = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+BQ_INIT_LOCK = threading.Lock()
+_BQ_TABLE_READY = False
 
 # Parallelism control
 MAX_PARALLEL_VIDEOS = int(os.environ.get("MAX_PARALLEL_VIDEOS", "2") or "1")
@@ -390,6 +402,107 @@ def upload_results_to_gcs(
         return False
 
 
+def get_bigquery_client() -> bigquery.Client:
+    return bigquery.Client(project=BQ_PROJECT_ID)
+
+
+def ensure_bigquery_table(client: bigquery.Client) -> None:
+    global _BQ_TABLE_READY
+    if _BQ_TABLE_READY:
+        return
+
+    with BQ_INIT_LOCK:
+        if _BQ_TABLE_READY:
+            return
+
+        dataset_id = f"{BQ_PROJECT_ID}.{BQ_DATASET}"
+        try:
+            client.get_dataset(dataset_id)
+        except gax_exceptions.NotFound:
+            dataset = bigquery.Dataset(dataset_id)
+            dataset.location = BQ_LOCATION
+            try:
+                client.create_dataset(dataset)
+            except gax_exceptions.Conflict:
+                pass
+
+        table_schema = [
+            bigquery.SchemaField("processing_date", "DATE"),
+            bigquery.SchemaField("video_name", "STRING"),
+            bigquery.SchemaField("timestamp_on_video", "STRING"),
+            bigquery.SchemaField("vehicle_id", "STRING"),
+            bigquery.SchemaField("violation_type", "STRING"),
+            bigquery.SchemaField("artifact_key", "STRING"),
+            bigquery.SchemaField("report_uri", "STRING"),
+            bigquery.SchemaField("processed_video_uri", "STRING"),
+            bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+        ]
+
+        try:
+            client.get_table(BQ_TABLE_ID)
+        except gax_exceptions.NotFound:
+            table = bigquery.Table(BQ_TABLE_ID, schema=table_schema)
+            client.create_table(table)
+
+        _BQ_TABLE_READY = True
+
+
+def upload_csv_to_bigquery(
+    csv_path: Path,
+    artifact_key: str,
+    display_name: str,
+    processed_gcs_uri: Optional[str],
+    report_gcs_uri: str,
+) -> None:
+    if not csv_path.exists():
+        return
+
+    client = get_bigquery_client()
+    ensure_bigquery_table(client)
+
+    rows_to_insert: List[Dict[str, Optional[str]]] = []
+    with csv_path.open("r", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for idx, row in enumerate(reader):
+            processing_date = row.get("Date") or None
+            timestamp_str = row.get("Timestamp On Video (ms)") or row.get("Timestamp On Video")
+            vehicle_id = row.get("Vehicle ID") or ""
+            violation_type = row.get("Did violate") or ""
+
+            rows_to_insert.append(
+                {
+                    "processing_date": processing_date,
+                    "video_name": display_name,
+                    "timestamp_on_video": timestamp_str,
+                    "vehicle_id": vehicle_id,
+                    "violation_type": violation_type,
+                    "artifact_key": artifact_key,
+                    "report_uri": report_gcs_uri,
+                    "processed_video_uri": processed_gcs_uri,
+                    "ingested_at": datetime.utcnow().isoformat() + "Z",
+                }
+            )
+
+    if not rows_to_insert:
+        return
+
+    row_ids: List[str] = []
+    for idx, row in enumerate(rows_to_insert):
+        ts_component = row["timestamp_on_video"] or str(idx)
+        row_ids.append(f"{artifact_key}:{row['vehicle_id']}:{ts_component}")
+
+    errors = client.insert_rows_json(
+        BQ_TABLE_ID,
+        rows_to_insert,
+        row_ids=row_ids,
+        skip_invalid_rows=False,
+        ignore_unknown_values=True,
+    )
+
+    if errors:
+        raise RuntimeError(f"BigQuery insert errors: {errors}")
+
+
 def upload_file_to_gcs_verified(local_path: Path, bucket_name: str, dest_object: str, max_retries: int = 3) -> bool:
     """Upload a single file with retries + size verification. Returns True on success."""
     storage_client = create_storage_client()
@@ -522,13 +635,39 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
         video_path_str = str(artifacts.video_path) if artifacts.video_path and artifacts.video_path.exists() else None
         csv_path_str = str(artifacts.csv_path) if artifacts.csv_path and artifacts.csv_path.exists() else None
 
-        _ = upload_results_to_gcs(
+        gcs_upload_ok = upload_results_to_gcs(
             bucket_name=DEST_BUCKET,
             output_video_path=video_path_str,
             csv_file_path=csv_path_str,
             video_name=display_name,
             report_name=artifact_key,
         )
+        if gcs_upload_ok and csv_path_str:
+            processed_gcs_uri = None
+            if video_path_str:
+                file_ext = Path(video_path_str).suffix
+                processed_gcs_uri = (
+                    f"gs://{DEST_BUCKET}/"
+                    f"{DEST_PREFIX.rstrip('/')}/{artifact_key}/{display_name}_processed{file_ext}"
+                )
+
+            report_gcs_uri = (
+                f"gs://{DEST_BUCKET}/"
+                f"{REPORT_PREFIX.rstrip('/')}/{artifact_key}_detection_report.csv"
+            )
+
+            try:
+                upload_csv_to_bigquery(
+                    csv_path=Path(csv_path_str),
+                    artifact_key=artifact_key,
+                    display_name=display_name,
+                    processed_gcs_uri=processed_gcs_uri,
+                    report_gcs_uri=report_gcs_uri,
+                )
+            except Exception as exc:
+                logging.error(f"Failed to upload report to BigQuery: {exc}")
+        elif not gcs_upload_ok:
+            logging.error("Skipping BigQuery upload because GCS upload failed")
 
         for screenshot in artifacts.screenshots:
             dest_object = f"{SCREENSHOT_PREFIX.rstrip('/')}/{screenshot.path.name}"
