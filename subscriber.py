@@ -13,6 +13,7 @@ import cv2
 from google.api_core import exceptions as gax_exceptions
 from google.cloud import pubsub_v1
 from google.cloud import storage
+from google.cloud.pubsub_v1.subscriber.scheduler import ThreadScheduler
 
 from combined_pipeline import CombinedArtifacts, process_video_combined
 
@@ -46,6 +47,7 @@ MAX_PARALLEL_VIDEOS = int(os.environ.get("MAX_PARALLEL_VIDEOS", "2") or "1")
 if MAX_PARALLEL_VIDEOS < 1:
     MAX_PARALLEL_VIDEOS = 1
 EXECUTOR = ThreadPoolExecutor(max_workers=MAX_PARALLEL_VIDEOS)
+SCHEDULER = ThreadScheduler(EXECUTOR)
 atexit.register(EXECUTOR.shutdown, wait=True)
 
 # Directory to place downloaded videos
@@ -592,8 +594,8 @@ def main() -> None:
     future = subscriber.subscribe(
         subscription_path,
         callback=callback,
-        executor=EXECUTOR,
         flow_control=flow_control,
+        scheduler=SCHEDULER,
     )
     print(f"Listening for messages on {subscription_path}...")
 
