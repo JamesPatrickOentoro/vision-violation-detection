@@ -3,8 +3,11 @@ import json
 import shutil
 import subprocess
 import logging
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import cv2
 from google.api_core import exceptions as gax_exceptions
@@ -37,6 +40,13 @@ REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "detection-reports/")
 # Default bucket updated per request: adaro-vision-results/screenshoot
 SCREENSHOT_BUCKET = os.environ.get("SCREENSHOT_BUCKET", "adaro-vision-results")
 SCREENSHOT_PREFIX = os.environ.get("SCREENSHOT_PREFIX", "screenshoot/")
+
+# Parallelism control
+MAX_PARALLEL_VIDEOS = int(os.environ.get("MAX_PARALLEL_VIDEOS", "2") or "1")
+if MAX_PARALLEL_VIDEOS < 1:
+    MAX_PARALLEL_VIDEOS = 1
+EXECUTOR = ThreadPoolExecutor(max_workers=MAX_PARALLEL_VIDEOS)
+atexit.register(EXECUTOR.shutdown, wait=True)
 
 # Directory to place downloaded videos
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "downloads"))
@@ -172,8 +182,18 @@ def is_video_path(path: str) -> bool:
     return ext in {".mp4", ".avi", ".mov", ".mkv"}
 
 
-def run_combined_detection(local_video_path: Path) -> CombinedArtifacts:
-    video_name = local_video_path.stem
+def build_artifact_key(object_name: str) -> str:
+    """Create a collision-resistant key that encodes the full GCS object path."""
+    sanitized = object_name.replace("\\", "/").strip("/")
+    sanitized = sanitized.replace("/", "__")
+    if "." in sanitized:
+        return sanitized.rsplit(".", 1)[0]
+    return sanitized
+
+
+def run_combined_detection(local_video_path: Path, video_name: Optional[str] = None) -> CombinedArtifacts:
+    if not video_name:
+        video_name = local_video_path.stem
     screenshot_base = Path("/tmp") / f"{video_name}_combined_screens"
     return process_video_combined(
         video_name=video_name,
@@ -445,8 +465,8 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
         print(f"New finalized object detected: gs://{bucket}/{object_name}")
 
         # Idempotency: skip if report already exists (and non-empty)
-        input_stem = Path(object_name).stem
-        report_obj = f"{REPORT_PREFIX.rstrip('/')}/{input_stem}_detection_report.csv"
+        artifact_key = build_artifact_key(object_name)
+        report_obj = f"{REPORT_PREFIX.rstrip('/')}/{artifact_key}_detection_report.csv"
         storage_client = storage.Client()
         rep_blob = storage_client.bucket(DEST_BUCKET).blob(report_obj)
         if rep_blob.exists():
@@ -462,7 +482,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                 message.ack()
                 return
 
-        local_path_original = DOWNLOAD_DIR / Path(object_name).name
+        local_path_original = DOWNLOAD_DIR / object_name
         download_gcs_object(bucket, object_name, local_path_original)
         print(f"Downloaded to: {local_path_original}")
 
@@ -485,7 +505,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                 f"Vehicle model not found at '{VEHICLE_MODEL_PATH}'. Set VEHICLE_MODEL_PATH env or place the file."
             )
 
-        artifacts = run_combined_detection(local_path)
+        artifacts = run_combined_detection(local_path, video_name=artifact_key)
         print(f"Processing completed for: {local_path}")
 
         video_path_str = str(artifacts.video_path) if artifacts.video_path and artifacts.video_path.exists() else None
@@ -495,7 +515,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
             bucket_name=DEST_BUCKET,
             output_video_path=video_path_str,
             csv_file_path=csv_path_str,
-            video_name=input_stem,
+            video_name=artifact_key,
         )
 
         for screenshot in artifacts.screenshots:
@@ -564,7 +584,17 @@ def main() -> None:
     subscriber = pubsub_v1.SubscriberClient()
     subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)
 
-    future = subscriber.subscribe(subscription_path, callback=callback)
+    flow_control = pubsub_v1.types.FlowControl(
+        max_messages=MAX_PARALLEL_VIDEOS,
+        max_lease_duration=3600,
+    )
+
+    future = subscriber.subscribe(
+        subscription_path,
+        callback=callback,
+        executor=EXECUTOR,
+        flow_control=flow_control,
+    )
     print(f"Listening for messages on {subscription_path}...")
 
     try:
