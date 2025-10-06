@@ -294,7 +294,14 @@ def create_storage_client() -> storage.Client:
     return storage.Client()
 
 
-def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_path: str | None, video_name: str, max_retries: int = 3) -> bool:
+def upload_results_to_gcs(
+    bucket_name: str,
+    output_video_path: str,
+    csv_file_path: str | None,
+    video_name: str,
+    report_name: str,
+    max_retries: int = 3,
+) -> bool:
     """Upload processed results to Google Cloud Storage with retries and verification"""
 
     def verify_upload(blob: storage.Blob, local_file: str) -> bool:
@@ -357,14 +364,15 @@ def upload_results_to_gcs(bucket_name: str, output_video_path: str, csv_file_pat
         if output_video_path and os.path.exists(output_video_path):
             file_ext = os.path.splitext(output_video_path)[1]
             video_prefix = DEST_PREFIX.rstrip('/')
-            video_blob = bucket.blob(f"{video_prefix}/{video_name}_processed{file_ext}")
+            video_blob_name = f"{video_prefix}/{report_name}/{video_name}_processed{file_ext}"
+            video_blob = bucket.blob(video_blob_name)
             if not upload_with_retry(video_blob, output_video_path, "video"):
                 raise Exception("Video upload failed after retries")
 
         # Upload CSV report (optional) under detection-reports/
         if csv_file_path and os.path.exists(csv_file_path):
             report_prefix = REPORT_PREFIX.rstrip('/')
-            csv_blob = bucket.blob(f"{report_prefix}/{video_name}_detection_report.csv")
+            csv_blob = bucket.blob(f"{report_prefix}/{report_name}_detection_report.csv")
             if not upload_with_retry(csv_blob, csv_file_path, "CSV report"):
                 raise Exception("CSV report upload failed after retries")
 
@@ -468,6 +476,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
 
         # Idempotency: skip if report already exists (and non-empty)
         artifact_key = build_artifact_key(object_name)
+        display_name = Path(object_name).stem
         report_obj = f"{REPORT_PREFIX.rstrip('/')}/{artifact_key}_detection_report.csv"
         storage_client = storage.Client()
         rep_blob = storage_client.bucket(DEST_BUCKET).blob(report_obj)
@@ -517,7 +526,8 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
             bucket_name=DEST_BUCKET,
             output_video_path=video_path_str,
             csv_file_path=csv_path_str,
-            video_name=artifact_key,
+            video_name=display_name,
+            report_name=artifact_key,
         )
 
         for screenshot in artifacts.screenshots:
