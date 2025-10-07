@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
+from urllib.parse import quote
 
 import cv2
 from google.api_core import exceptions as gax_exceptions
@@ -373,10 +374,12 @@ def upload_results_to_gcs(
         bucket = storage_client.bucket(bucket_name)
 
         # Upload processed video
+        processed_blob_path = None
         if output_video_path and os.path.exists(output_video_path):
             file_ext = os.path.splitext(output_video_path)[1]
             video_prefix = DEST_PREFIX.rstrip('/')
-            video_blob_name = f"{video_prefix}/{report_name}/{video_name}_processed{file_ext}"
+            processed_blob_path = f"{video_prefix}/{report_name}/{video_name}_processed{file_ext}"
+            video_blob_name = processed_blob_path
             video_blob = bucket.blob(video_blob_name)
             if not upload_with_retry(video_blob, output_video_path, "video"):
                 raise Exception("Video upload failed after retries")
@@ -646,9 +649,12 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
             processed_gcs_uri = None
             if video_path_str:
                 file_ext = Path(video_path_str).suffix
-                processed_gcs_uri = (
-                    f"gs://{DEST_BUCKET}/"
+                processed_blob_path = (
                     f"{DEST_PREFIX.rstrip('/')}/{artifact_key}/{display_name}_processed{file_ext}"
+                )
+                processed_gcs_uri = (
+                    f"https://storage.cloud.google.com/{DEST_BUCKET}/"
+                    f"{quote(processed_blob_path, safe='/')}"
                 )
 
             report_gcs_uri = (
