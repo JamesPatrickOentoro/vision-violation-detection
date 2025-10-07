@@ -439,6 +439,7 @@ def ensure_bigquery_table(client: bigquery.Client) -> None:
             bigquery.SchemaField("report_uri", "STRING"),
             bigquery.SchemaField("processed_video_uri", "STRING"),
             bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+            bigquery.SchemaField("authenticated_url", "STRING"),
         ]
 
         try:
@@ -456,6 +457,7 @@ def upload_csv_to_bigquery(
     display_name: str,
     processed_gcs_uri: Optional[str],
     report_gcs_uri: str,
+    authenticated_url: Optional[str] = None,
 ) -> None:
     if not csv_path.exists():
         return
@@ -483,6 +485,7 @@ def upload_csv_to_bigquery(
                     "report_uri": report_gcs_uri,
                     "processed_video_uri": processed_gcs_uri,
                     "ingested_at": datetime.utcnow().isoformat() + "Z",
+                    "authenticated_url": authenticated_url,
                 }
             )
 
@@ -647,6 +650,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
         )
         if gcs_upload_ok and csv_path_str:
             processed_gcs_uri = None
+            authenticated_url = None
             if video_path_str:
                 file_ext = Path(video_path_str).suffix
                 processed_blob_path = (
@@ -656,6 +660,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                     f"https://storage.cloud.google.com/{DEST_BUCKET}/"
                     f"{quote(processed_blob_path, safe='/')}"
                 )
+                authenticated_url = processed_gcs_uri
 
             report_gcs_uri = (
                 f"gs://{DEST_BUCKET}/"
@@ -669,6 +674,7 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                     display_name=display_name,
                     processed_gcs_uri=processed_gcs_uri,
                     report_gcs_uri=report_gcs_uri,
+                    authenticated_url=authenticated_url,
                 )
             except Exception as exc:
                 logging.error(f"Failed to upload report to BigQuery: {exc}")
