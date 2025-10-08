@@ -28,11 +28,11 @@ from contraflow.detector import ContraflowDetector
 from stopvideo import StopVideo
 
 
-SPEED_LIMIT_KMH = float(os.environ.get("SPEED_LIMIT_KMH", "20"))
+SPEED_LIMIT_KMH = float(os.environ.get("SPEED_LIMIT_KMH", "30"))
 SPEED_SMOOTHING_FRAMES = int(os.environ.get("SPEED_SMOOTHING_FRAMES", "7"))
 PIXELS_PER_METER = float(os.environ.get("PIXELS_PER_METER", "9.12"))
 HOMOGRAPHY_MATRIX_PATH = os.environ.get("HOMOGRAPHY_MATRIX_PATH", "homography.npy")
-RANGE_THRESHOLD_METERS = float(os.environ.get("RANGE_THRESHOLD_METERS", "10"))
+RANGE_THRESHOLD_METERS = float(os.environ.get("RANGE_THRESHOLD_METERS", "5"))
 
 
 @dataclass

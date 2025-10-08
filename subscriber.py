@@ -49,7 +49,7 @@ SCREENSHOT_PREFIX = os.environ.get("SCREENSHOT_PREFIX", "screenshoot/")
 # BigQuery destinations for structured reporting
 BQ_PROJECT_ID = os.environ.get("BQ_PROJECT_ID", PROJECT_ID)
 BQ_DATASET = os.environ.get("BQ_DATASET", "vision_result")
-BQ_TABLE = os.environ.get("BQ_TABLE", "vision_reports")
+BQ_TABLE = os.environ.get("BQ_TABLE", "vision_reports_v2")
 BQ_LOCATION = os.environ.get("BQ_LOCATION", "asia-southeast1")
 BQ_TABLE_ID = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
 BQ_INIT_LOCK = threading.Lock()
