@@ -53,6 +53,7 @@ class ScreenshotArtifact:
     frame_idx: int
     violation_type: str
     vehicle_id: str
+    timestamp: str
 
 
 @dataclass
@@ -548,6 +549,7 @@ def process_video_combined(
                     frame_idx=frame_idx,
                     violation_type="stop violation",
                     vehicle_id=str(car_id),
+                    timestamp=timestamp_str,
                 )
             )
 
@@ -587,6 +589,7 @@ def process_video_combined(
                     frame_idx=frame_idx,
                     violation_type=violation_label,
                     vehicle_id=track_pair if event_type == "range" else track_id,
+                    timestamp=timestamp_str,
                 )
             )
 

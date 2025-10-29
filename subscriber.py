@@ -9,7 +9,7 @@ import atexit
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from urllib.parse import quote
 
 import cv2
@@ -19,7 +19,7 @@ from google.cloud import storage
 from google.cloud.pubsub_v1.subscriber.scheduler import ThreadScheduler
 from google.cloud import bigquery
 
-from combined_pipeline import CombinedArtifacts, process_video_combined
+from combined_pipeline import CombinedArtifacts, process_video_combined, ScreenshotArtifact
 
 
 # Configuration via environment variables with sensible defaults
@@ -49,7 +49,7 @@ SCREENSHOT_PREFIX = os.environ.get("SCREENSHOT_PREFIX", "screenshoot/")
 # BigQuery destinations for structured reporting
 BQ_PROJECT_ID = os.environ.get("BQ_PROJECT_ID", PROJECT_ID)
 BQ_DATASET = os.environ.get("BQ_DATASET", "vision_result")
-BQ_TABLE = os.environ.get("BQ_TABLE", "vision_reports_v2")
+BQ_TABLE = os.environ.get("BQ_TABLE", "vision_reports_v3")
 BQ_LOCATION = os.environ.get("BQ_LOCATION", "asia-southeast1")
 BQ_TABLE_ID = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
 BQ_INIT_LOCK = threading.Lock()
@@ -440,6 +440,7 @@ def ensure_bigquery_table(client: bigquery.Client) -> None:
             bigquery.SchemaField("processed_video_uri", "STRING"),
             bigquery.SchemaField("ingested_at", "TIMESTAMP"),
             bigquery.SchemaField("authenticated_url", "STRING"),
+            bigquery.SchemaField("screenshot_authenticated_url", "STRING"),
         ]
 
         try:
@@ -458,12 +459,17 @@ def upload_csv_to_bigquery(
     processed_gcs_uri: Optional[str],
     report_gcs_uri: str,
     authenticated_url: Optional[str] = None,
+    screenshot_links: Optional[Dict[Tuple[str, str, str], List[str]]] = None,
 ) -> None:
     if not csv_path.exists():
         return
 
     client = get_bigquery_client()
     ensure_bigquery_table(client)
+
+    links_lookup: Dict[Tuple[str, str, str], List[str]] = {}
+    if screenshot_links:
+        links_lookup = {key: values[:] for key, values in screenshot_links.items()}
 
     rows_to_insert: List[Dict[str, Optional[str]]] = []
     with csv_path.open("r", newline="") as csv_file:
@@ -473,6 +479,18 @@ def upload_csv_to_bigquery(
             timestamp_str = row.get("Timestamp On Video (ms)") or row.get("Timestamp On Video")
             vehicle_id = row.get("Vehicle ID") or ""
             violation_type = row.get("Did violate") or ""
+            lookup_key = (
+                vehicle_id or "",
+                violation_type or "",
+                timestamp_str or "",
+            )
+            screenshot_url = None
+            if links_lookup:
+                urls = links_lookup.get(lookup_key)
+                if urls:
+                    screenshot_url = urls.pop(0)
+                    if not urls:
+                        links_lookup.pop(lookup_key, None)
 
             rows_to_insert.append(
                 {
@@ -486,6 +504,7 @@ def upload_csv_to_bigquery(
                     "processed_video_uri": processed_gcs_uri,
                     "ingested_at": datetime.utcnow().isoformat() + "Z",
                     "authenticated_url": authenticated_url,
+                    "screenshot_authenticated_url": screenshot_url,
                 }
             )
 
@@ -640,6 +659,21 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
 
         video_path_str = str(artifacts.video_path) if artifacts.video_path and artifacts.video_path.exists() else None
         csv_path_str = str(artifacts.csv_path) if artifacts.csv_path and artifacts.csv_path.exists() else None
+        screenshot_upload_plan: List[Tuple[ScreenshotArtifact, str]] = []
+        screenshot_link_map: Dict[Tuple[str, str, str], List[str]] = {}
+        for screenshot in artifacts.screenshots:
+            dest_object = f"{SCREENSHOT_PREFIX.rstrip('/')}/{screenshot.path.name}"
+            screenshot_upload_plan.append((screenshot, dest_object))
+            screenshot_url = (
+                f"https://storage.cloud.google.com/{SCREENSHOT_BUCKET}/"
+                f"{quote(dest_object, safe='/')}"
+            )
+            key = (
+                screenshot.vehicle_id or "",
+                screenshot.violation_type or "",
+                screenshot.timestamp or "",
+            )
+            screenshot_link_map.setdefault(key, []).append(screenshot_url)
 
         gcs_upload_ok = upload_results_to_gcs(
             bucket_name=DEST_BUCKET,
@@ -675,14 +709,14 @@ def callback(message: pubsub_v1.subscriber.message.Message) -> None:
                     processed_gcs_uri=processed_gcs_uri,
                     report_gcs_uri=report_gcs_uri,
                     authenticated_url=authenticated_url,
+                    screenshot_links=screenshot_link_map if screenshot_link_map else None,
                 )
             except Exception as exc:
                 logging.error(f"Failed to upload report to BigQuery: {exc}")
         elif not gcs_upload_ok:
             logging.error("Skipping BigQuery upload because GCS upload failed")
 
-        for screenshot in artifacts.screenshots:
-            dest_object = f"{SCREENSHOT_PREFIX.rstrip('/')}/{screenshot.path.name}"
+        for screenshot, dest_object in screenshot_upload_plan:
             if upload_file_to_gcs_verified(screenshot.path, SCREENSHOT_BUCKET, dest_object):
                 try:
                     screenshot.path.unlink()
