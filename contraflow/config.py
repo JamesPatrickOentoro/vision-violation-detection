@@ -115,6 +115,9 @@ OPPOSING_LANES = {
 # Detection thresholds - Optimized for numpy float32
 CONTRAFLOW_THRESHOLD = np.float32(-0.3)
 DIRECTION_THRESHOLD = np.float32(0.1)
+WRONG_WAY_DISTANCE_THRESHOLD = np.float32(
+    float(os.getenv("WRONG_WAY_DISTANCE_THRESHOLD", "60.0"))
+)
 
 # Expected traffic directions for each lane - Pre-normalized for maximum performance
 EXPECTED_DIRECTIONS = {

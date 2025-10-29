@@ -8,8 +8,14 @@ import logging
 # Enable numpy optimizations for maximum performance
 np.seterr(divide='ignore', invalid='ignore')  # Suppress warnings for speed
 from .config import (
-    ROIS, EXPECTED_DIRECTIONS, ROI_CENTER_INTERSECTION, CONTRAFLOW_THRESHOLD,
-    LANE_COLORS, CONTRAFLOW_COLOR, OK_COLOR
+    ROIS,
+    EXPECTED_DIRECTIONS,
+    ROI_CENTER_INTERSECTION,
+    CONTRAFLOW_THRESHOLD,
+    WRONG_WAY_DISTANCE_THRESHOLD,
+    LANE_COLORS,
+    CONTRAFLOW_COLOR,
+    OK_COLOR,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,9 +37,10 @@ class ContraflowDetector:
         # Constants
         self.TRACKING_POINT_Y_OFFSET = 0.23  # 80% down from center
         self.MINIMUM_MOVEMENT_THRESHOLD = 5
-        self.WRONG_WAY_THRESHOLD = 0
         self.DIRECTION_VIOLATION_CONFIRMATION_FRAMES = 10
         self.PATH_VIOLATION_CONFIRMATION_FRAMES = 2
+        self.wrong_way_distance_threshold = float(WRONG_WAY_DISTANCE_THRESHOLD)
+        self.contraflow_threshold = float(CONTRAFLOW_THRESHOLD)
         
         # Legal directions
         self.legal_directions = {
@@ -57,6 +64,7 @@ class ContraflowDetector:
         self.vehicle_path_violation_counter = {}
         self.logged_contraflow_ids = set()
         self.contraflow_screenshot_taken = set()
+        self.vehicle_wrong_way_distance = {}
     
     def get_direction(self, point1, point2):
         """Calculate the direction vector between two points - OPTIMIZED."""
@@ -95,9 +103,11 @@ class ContraflowDetector:
         self.assign_vehicle_to_lane(track_id, center_point)
         
         assigned_lane = self.vehicle_assigned_lane.get(track_id)
-        
+        current_distance = self.vehicle_wrong_way_distance.get(track_id, 0.0)
+
         # Need lane assignment and sufficient tracking history
         if not assigned_lane or len(self.track_history[track_id]) <= 5:
+            self.vehicle_wrong_way_distance[track_id] = current_distance
             return False
         
         # Check if vehicle is in the center intersection dead zone
@@ -105,6 +115,7 @@ class ContraflowDetector:
         
         # Don't apply contraflow checks in the center dead zone
         if in_center_zone:
+            self.vehicle_wrong_way_distance[track_id] = 0.0
             return False
         
         # Calculate current movement direction
@@ -115,11 +126,41 @@ class ContraflowDetector:
         # Get list of expected directions for the lane
         expected_directions = EXPECTED_DIRECTIONS.get(assigned_lane)
         if expected_directions:
-            # Check if current direction matches ANY of the expected directions
-            is_ok = any(np.dot(current_direction, exp_dir) > CONTRAFLOW_THRESHOLD for exp_dir in expected_directions)
-            # Contraflow is detected if the direction is NOT OK
-            return not is_ok
+            direction_scores = [float(np.dot(current_direction, exp_dir)) for exp_dir in expected_directions]
+            if direction_scores:
+                max_direction_score = max(direction_scores)
+            else:
+                max_direction_score = -1.0
+
+            segment_distance = float(
+                np.linalg.norm(np.array(last_point, dtype=np.float32) - np.array(prev_point, dtype=np.float32))
+            )
+            if not np.isfinite(segment_distance):
+                segment_distance = 0.0
+
+            if max_direction_score > self.contraflow_threshold:
+                updated_distance = 0.0
+            else:
+                updated_distance = current_distance + segment_distance
+
+            self.vehicle_wrong_way_distance[track_id] = updated_distance
+
+            is_contraflow = (
+                max_direction_score <= self.contraflow_threshold
+                and updated_distance >= self.wrong_way_distance_threshold
+            )
+            if is_contraflow and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Contraflow detected for track %s: score %.3f (threshold %.3f), distance %.2f/%.2f",
+                    track_id,
+                    max_direction_score,
+                    self.contraflow_threshold,
+                    updated_distance,
+                    self.wrong_way_distance_threshold,
+                )
+            return is_contraflow
         
+        self.vehicle_wrong_way_distance[track_id] = current_distance
         return False
     
     def update_track_history(self, track_id, center_point):
@@ -155,6 +196,7 @@ class ContraflowDetector:
                      color=LANE_COLORS['center'], thickness=2)  # White
         
         return frame
+
     
     def draw_track_history(self, frame, track_id):
         """Draw vehicle tracking trail on frame - OPTIMIZED."""
