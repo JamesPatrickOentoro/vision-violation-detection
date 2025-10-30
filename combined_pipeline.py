@@ -33,6 +33,7 @@ SPEED_SMOOTHING_FRAMES = int(os.environ.get("SPEED_SMOOTHING_FRAMES", "7"))
 PIXELS_PER_METER = float(os.environ.get("PIXELS_PER_METER", "9.12"))
 HOMOGRAPHY_MATRIX_PATH = os.environ.get("HOMOGRAPHY_MATRIX_PATH", "homography.npy")
 RANGE_THRESHOLD_METERS = float(os.environ.get("RANGE_THRESHOLD_METERS", "5"))
+DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.4"))
 
 
 @dataclass
@@ -187,6 +188,7 @@ class ContraflowSequentialProcessor:
                 classes=MODEL_CLASSES,
                 verbose=False,
                 device=self.device,
+                conf=DETECTION_CONFIDENCE,
             )
 
             if not results:
