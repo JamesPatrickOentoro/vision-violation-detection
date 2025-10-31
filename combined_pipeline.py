@@ -34,6 +34,7 @@ PIXELS_PER_METER = float(os.environ.get("PIXELS_PER_METER", "9.12"))
 HOMOGRAPHY_MATRIX_PATH = os.environ.get("HOMOGRAPHY_MATRIX_PATH", "homography.npy")
 RANGE_THRESHOLD_METERS = float(os.environ.get("RANGE_THRESHOLD_METERS", "5"))
 DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.4"))
+TRACKING_POINT_Y_RATIO = float(os.environ.get("TRACKING_POINT_Y_RATIO", "0.75"))
 
 
 @dataclass
@@ -210,7 +211,7 @@ class ContraflowSequentialProcessor:
             for box, track_id in zip(boxes_np, ids):
                 x1, y1, x2, y2 = [int(v) for v in box]
                 center_x = (x1 + x2) / 2.0
-                center_y = (y1 + y2) / 2.0
+                center_y = y1 + (y2 - y1) * TRACKING_POINT_Y_RATIO
                 center_point = (center_x, center_y)
 
                 self.detector.update_track_history(track_id, center_point)
